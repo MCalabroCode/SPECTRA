@@ -8,3 +8,5 @@
 /test_18_december_filtering__64_embeddings__32d.pth
 /vcc
 /depmap
+/Patrick_networks
+*.pth

@@ -451,6 +451,8 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, live_plot):
 
         feat_train_loss.append(avg_feat)
         kl_train_loss.append(avg_kl)
+
+        torch.save(model.state_dict(), f"temp_weights_epoch_{epoch}.pth")
         
         if epoch!=0:
 
