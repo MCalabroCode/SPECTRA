@@ -27,7 +27,7 @@ print(device)
 ########## data
 adata = sc.read_h5ad('../data/vcc_data/adata_Training.h5ad')
 sc.pp.filter_cells(adata, min_genes=200)
-sc.pp.filter_genes(adata, min_cells=3)
+#sc.pp.filter_genes(adata, min_cells=3)
 adata.raw = adata.copy() 
 sc.pp.normalize_total(adata, target_sum = 1e4)
 sc.pp.log1p(adata)
@@ -37,21 +37,48 @@ adata = adata[adata.obs['target_gene'].isin(valid_pert)]
 gene_list = adata.var_names.tolist()
 
 ############ grn
-with open("grn_coexpression_vcc_data.pkl", "rb") as file:
-    G = pickle.load(file)
-genes_not_included = [gene for gene in gene_list if gene not in list(G.nodes)] # some genes of gene_list are not included!
-G.add_nodes_from(genes_not_included)
+# with open("grn_coexpression_vcc_data.pkl", "rb") as file:
+#     G = pickle.load(file)
+# genes_not_included = [gene for gene in gene_list if gene not in list(G.nodes)] # some genes of gene_list are not included!
+# G.add_nodes_from(genes_not_included)
+# num_nodes = G.number_of_nodes()
+# num_edges = G.number_of_edges()
+# num_features = 1
+
+# nodes_to_remove = [node for node in G.nodes() if node not in gene_list]
+# G.remove_nodes_from(nodes_to_remove)
+# num_nodes = G.number_of_nodes()
+# num_edges = G.number_of_edges()
+# print("Number of nodes:", num_nodes)
+# print("Number of edges:", num_edges)
+# print("Number of node features per node:", num_features)
+
+# patrick guanlab (stock)
+A = np.load('Patrick_networks/guanlab_stock_3.5k_directed.npz')
+adjacency = A['adjacency']
+gene_names = A['gene_names']
+G = nx.from_numpy_array(
+    adjacency,
+    parallel_edges=False,
+    create_using=nx.DiGraph(),
+    edge_attr='weight',  # Attribute name for weights
+)
+
+# Relabel nodes with gene names (must be same length as matrix dims)
+mapping = {i: gene_names[i] for i in range(len(gene_names))}
+G = nx.relabel_nodes(G, mapping)
+G.remove_edges_from([(u, v) for u, v, d in G.edges(data=True) if np.log(d['weight']+1) < 8]) # naive pruning
 num_nodes = G.number_of_nodes()
 num_edges = G.number_of_edges()
 num_features = 1
-
-nodes_to_remove = [node for node in G.nodes() if node not in gene_list]
-G.remove_nodes_from(nodes_to_remove)
-num_nodes = G.number_of_nodes()
-num_edges = G.number_of_edges()
 print("Number of nodes:", num_nodes)
 print("Number of edges:", num_edges)
 print("Number of node features per node:", num_features)
+
+# data filtering
+gene_list = gene_names.tolist()
+mask = adata.var_names.isin(gene_names)
+adata = adata[:, mask].copy()
 
 assert set(G.nodes) == set(adata.var_names), "Nodes in G and adata.var_names differ!"
 
@@ -150,7 +177,7 @@ from WMSE import compute_weights
 gene_weights = compute_weights(adata[0:train_size,:], gene_to_idx, cells_per_pert=256)
 
 ###### model def
-from spectra_2v import PerturbModel
+from spectra import PerturbModel
 
 model = PerturbModel(
     edge_index, 
@@ -169,13 +196,13 @@ print(f'number of parameters: {num_trainable_params}')
 
 ######## model training 
 #from model_v3_efficient import train
-from spectra_2v import train
+from spectra import train
 feat_train_loss, _, feat_test_values = train(model=model, 
     train_loader=train_loader, 
     test_loader=val_loader,
     lr=0.003, 
-    n_epochs=30, 
+    n_epochs=20, 
     device=device, 
     live_plot=True)
 
-torch.save(model.state_dict(), "complete_29gen.pth")
+torch.save(model.state_dict(), "complete_17feb_guanlab.pth")

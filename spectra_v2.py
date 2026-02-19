@@ -1,0 +1,460 @@
+#
+# new SPECTRA! Let's revolutionalize everything! LEETS F***ING GO
+#
+
+import numpy as np
+import matplotlib.pyplot as plt
+from IPython.display import clear_output, display
+from tqdm import tqdm
+from matplotlib.ticker import MaxNLocator
+import os
+import torch
+import torch.nn.functional as F
+from torch_geometric.nn import ChebConv, DirGNNConv
+from torch_geometric.utils import dropout_edge
+from torch.nn import ReLU, LeakyReLU, GELU, LayerNorm
+
+
+class VariationalGraphEncoder(torch.nn.Module):
+    ''' encoder class
+    '''
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.out_channels = out_channels
+        self.conv1 = DirGNNConv(ChebConv(in_channels, out_channels, 3)) 
+        self.ln1 = LayerNorm(out_channels)
+        self.conv2 = DirGNNConv(ChebConv(out_channels, 2*out_channels, 3))
+        self.ln2 = LayerNorm(2*out_channels)
+        self.conv_mu = DirGNNConv(ChebConv(2*out_channels, out_channels, 2))  
+        self.conv_logstd = DirGNNConv(ChebConv(2*out_channels, out_channels, 2))
+        self.dropout_rate = 0.2
+
+    def forward(self, x, edge_index):
+        x = F.dropout(x, p=self.dropout_rate, training=self.training)
+        x = self.conv1(x, edge_index)
+        x = self.ln1(x)
+        x = F.gelu(x)
+
+        x = F.dropout(x, p=self.dropout_rate, training=self.training)
+        x = self.conv2(x, edge_index)
+        x = self.ln2(x)
+        x = F.gelu(x) 
+        
+        mu = self.conv_mu(x, edge_index)
+        logst = self.conv_logstd(x, edge_index)
+        return mu, logst
+
+class MLP(torch.nn.Module):
+    '''
+    MLP auxiliary class
+    '''
+    def __init__(self, sizes, batch_norm=True, dropout=0.2):
+        super(MLP, self).__init__()
+        layers = []
+        for s in range(len(sizes) - 1):
+            layers = layers + [
+                torch.nn.Dropout(p=dropout),
+                torch.nn.Linear(sizes[s], sizes[s + 1]),
+                torch.nn.BatchNorm1d(sizes[s + 1])
+                if batch_norm and s < len(sizes) - 1 else None,
+                torch.nn.ReLU()
+            ]
+
+        layers = [l for l in layers if l is not None][:-1]
+        self.network = torch.nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.network(x)
+
+class FeatureDecoder(torch.nn.Module):
+    ''' 
+    Feature decoder
+    '''
+    def __init__(self, n_channels, num_node_features):
+        super().__init__()
+        self.conv1 = DirGNNConv(ChebConv(n_channels, n_channels, 3))
+        self.ln1 = LayerNorm(n_channels)
+        self.conv2 = DirGNNConv(ChebConv(n_channels, n_channels, 3))
+        self.ln2 = LayerNorm(n_channels)
+        self.dropout_rate = 0.2
+        self.last_layer = MLP([n_channels, n_channels, 1], dropout=0.1)
+
+    def forward(self, z, edge_index):
+        z = F.dropout(z, p=self.dropout_rate, training=self.training)
+        z = self.conv1(z, edge_index)
+        z = self.ln1(z)
+        z = F.gelu(z)
+
+        z = F.dropout(z, p=self.dropout_rate, training=self.training)
+        z = self.conv2(z, edge_index)
+        z = self.ln2(z)
+        z = F.gelu(z)
+        
+        return self.last_layer(z)
+
+class PerturbModel(torch.nn.Module):
+    '''
+    SPECTRA model class
+    '''
+    def __init__(self, edge_index, num_nodes, device, gene_weights=None, num_node_features=1, n_channels=32, edge_dropout_p=0.2):
+        super().__init__()
+        self.device = device 
+        self.num_nodes = num_nodes 
+        self.n_channels = n_channels
+        self.register_buffer('edge_index', edge_index)
+        self.edge_dropout_p = edge_dropout_p
+
+        # Weight Lookup Construction. We need N+1 rows. The last row (index N) is for control (gene_weights[-1]).
+        default_weights = gene_weights.get(-1) if gene_weights.get(-1) is not None else (1/num_nodes)*torch.ones(num_nodes)
+        weight_lookup = default_weights.unsqueeze(0).repeat(num_nodes + 1, 1).to(device)    
+        if isinstance(gene_weights, dict):
+            for pert_idx, weight_array in gene_weights.items():
+                w_tensor = torch.tensor(weight_array, dtype=torch.float32, device=device)
+                if pert_idx == -1:
+                    weight_lookup[num_nodes] = w_tensor # Explicitly set the control row (index N)
+                elif 0 <= pert_idx < num_nodes:
+                    weight_lookup[pert_idx] = w_tensor
+        self.register_buffer('weight_lookup', weight_lookup)
+
+        # # Project & Add Architecture
+        # self.embedding_dim = 64 
+        # self.gene_embedding = torch.nn.Embedding(num_nodes, self.embedding_dim)
+        
+        # # Project scalar GEX to matching dimension
+        # self.gex_projection = torch.nn.Linear(num_node_features, self.embedding_dim)
+        
+        # Input to encoder is embedding_dim (because we add them, not concat)
+        self.encoder_in_channels = 1#self.embedding_dim
+
+        # Learnable KO perturbation Token
+        self.ko_token = torch.nn.Parameter(torch.randn(1, n_channels) - 2.0)
+
+        self.encoder = VariationalGraphEncoder(self.encoder_in_channels, n_channels)
+        self.gex_decoder = FeatureDecoder(n_channels, num_node_features)
+
+        self._cached_batch_size = 0
+        self._cached_edge_index = None
+        self._cached_gene_ids = None
+    
+    def _get_batched_edge_index(self, batch_size):
+        '''
+        batched edge lists - edges of the DAG are always the same for every sample
+        '''
+        if batch_size == self._cached_batch_size and self._cached_edge_index is not None:
+            return self._cached_edge_index
+        offsets = torch.arange(batch_size, device=self.device) * self.num_nodes
+        edge_index_batch = self.edge_index.unsqueeze(1) + offsets.view(1, -1, 1)
+        edge_index_batch = edge_index_batch.reshape(2, -1)
+        self._cached_batch_size = batch_size
+        self._cached_edge_index = edge_index_batch
+        return edge_index_batch
+
+    
+    def _get_batched_gene_ids(self, batch_size):
+        '''
+        repeats the genes ids exactly batch_size times (e.g. [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3])
+        '''
+        if self._cached_gene_ids is not None and len(self._cached_gene_ids) == batch_size * self.num_nodes:
+            return self._cached_gene_ids
+        ids = torch.arange(self.num_nodes, device=self.device)
+        ids = ids.repeat(batch_size) 
+        self._cached_gene_ids = ids
+        return ids
+
+    def reparametrize(self, mu, logstd):
+        if self.training:
+            return mu + torch.randn_like(logstd) * torch.exp(logstd)
+        else:
+            return mu
+
+    def kl_loss(self, mu, logstd, threshold=1e-2, verbose=True, free_bits=0.05):
+
+        kl_raw = -0.5 * (1 + 2 * logstd - mu**2 - logstd.exp()**2)
+        kl_per_dim = torch.mean(kl_raw, dim=0)
+
+        kl_per_dim_clamped = torch.clamp(kl_per_dim, min=free_bits)
+        return torch.sum(kl_per_dim_clamped)
+
+    def forward(self, data, return_latent=True):
+
+        x, pert = data
+        x = x.to(self.device) #[B,N,1]
+        pert = pert.to(self.device) #[B,N]
+
+        batch_size, num_nodes, num_features = x.shape
+
+        edge_index_batch = self._get_batched_edge_index(batch_size)
+
+        x = x.reshape(batch_size * num_nodes, num_features) #[BxN,1]
+
+        # # Project GEX
+        # gex_vec = self.gex_projection(x) # [B*N, 64]
+
+        # # Get Embedding
+        # gene_ids = self._get_batched_gene_ids(batch_size)
+        # emb = self.gene_embedding(gene_ids) # [B*N, 64]
+
+        # # Add
+        # x_input = gex_vec + emb 
+
+        pert = pert.reshape(batch_size * num_nodes) #[BxN]
+
+        # Edge Dropout
+        if self.training and self.edge_dropout_p > 0:
+            edge_index_batch, _ = dropout_edge(
+                edge_index_batch, 
+                p=self.edge_dropout_p, 
+                force_undirected=False,
+                training=self.training
+            )
+
+        mu, logstd = self.encoder(x, edge_index_batch)
+        logstd = torch.clamp(logstd, min=-20, max=10) # this is to avoid inf values
+
+        self.last_mu = mu          
+        self.last_logstd = logstd  
+
+        z = self.reparametrize(mu, logstd)     
+
+        self.last_z = z
+        x_hat = self.gex_decoder(z, edge_index_batch)
+        
+        # additive logic:
+        mask = pert.unsqueeze(1).to(z.dtype)
+        z = z + (mask * self.ko_token)
+
+        y_hat = self.gex_decoder(z, edge_index_batch)
+        
+        return y_hat, x_hat
+
+
+    def predict_full_expression(self, data):
+        self.eval()
+        return self.forward(data)[0]
+    
+    def generative_prediction(self, ko_gene_idx, n_samples=1):
+        self.eval()
+        with torch.no_grad():
+
+            # Support batched generation
+            z_basal = torch.randn(self.num_nodes * n_samples, self.n_channels).to(self.device)
+            
+            z_perturbed = z_basal.clone()
+            
+            # Apply KO token to specific indices
+            offsets = torch.arange(n_samples, device=self.device) * self.num_nodes
+            flat_ko_indices = ko_gene_idx + offsets
+            z_perturbed[flat_ko_indices, :] = self.ko_token
+            
+            edge_index_batch = self._get_batched_edge_index(n_samples)
+
+            predicted_expression = self.gex_decoder(z_perturbed, edge_index_batch)[0]
+            predicted_expression = predicted_expression.reshape(n_samples, self.num_nodes)
+            return predicted_expression
+
+######### training + testing routines ##########
+
+def _get_beta_schedule(epoch, n_epochs, n_cycles=1, ratio=0.5):
+    period = n_epochs // n_cycles 
+    step = epoch % period
+    if step < period * ratio:
+        return step / (period * ratio)
+    else:
+        return 1.0
+
+def compute_mmd(x, y, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
+    """
+    Computes the Maximum Mean Discrepancy (MMD) between two batches of samples x and y.
+    Uses a multi-scale RBF kernel by averaging multiple bandwiths.
+    """
+
+    assert x.shape == y.shape, "control and perturbed batches do not match in size."
+
+    batch_size = x.size(0)
+    n_samples = int(x.size(0)) + int(y.size(0))
+    
+    # If not enough samples to compute distribution statistics, return 0 or simple distance
+    if batch_size <= 1:
+        return torch.tensor(0.0, device=x.device)
+
+    total = torch.cat([x, y], dim=0)
+    
+    # L2 Distance Matrix
+    L2_distance = torch.cdist(total, total, p=2)**2
+    
+    # Bandwidth selection
+    if fix_sigma:
+        bandwidth = fix_sigma
+    else:
+        bandwidth = torch.sum(L2_distance.detach()) / (n_samples**2 - n_samples)
+    bandwidth /= kernel_mul ** (kernel_num // 2)
+    bandwidth_list = [bandwidth * (kernel_mul**i) for i in range(kernel_num)]
+    
+    # multiple kernels calculation + averaging
+    kernel_val = [torch.exp(-L2_distance / bandwidth_temp) for bandwidth_temp in bandwidth_list]
+    kernel_val = sum(kernel_val)
+
+    # MMD Calculation
+    XX = kernel_val[:batch_size, :batch_size]
+    YY = kernel_val[batch_size:, batch_size:]
+    XY = kernel_val[:batch_size, batch_size:]
+    YX = kernel_val[batch_size:, :batch_size]
+    
+    loss = torch.mean(XX + YY - XY - YX)
+    return loss
+
+def train_step_perturb_model(model, data, device, alpha=1., beta=1., mmd_gamma=0.1):
+    x, y, pert = data  # x,y: [B,N,1], pert: [B,N]
+    x, y, pert = x.to(device), y.to(device), pert.to(device)
+
+    B, N, _ = x.shape
+
+    y_hat, x_hat = model((x,pert)) #[BxN,1]
+
+    # flatten ground truth to match forward outputs for recon
+    x_flat = x.reshape(B * N, 1)
+    y_flat = y.reshape(B * N, 1)
+
+    # control cells (x_hat): ELBO loss
+    squared_error = (x_hat - x_flat) ** 2 # [B*N,1]
+    loss_feat = squared_error.view(B, N).mean(dim=1).mean()  # sum over genes, mean over cells
+
+    kl_div = model.kl_loss(model.last_mu, model.last_logstd)
+
+    # Cosine similarity (Direction)
+    x_true = x_flat.view(B, N)
+    y_true = y_flat.view(B, N)
+    x_pred = x_hat.view(B, N)
+    y_pred = y_hat.view(B, N)
+
+    delta_true = y_true - x_true
+    delta_pred = y_pred - x_pred
+
+    true_norm = torch.norm(delta_true, dim=1)
+    mask_has_signal = true_norm > 1e-6
+    if mask_has_signal.any():
+        cos_sim = F.cosine_similarity(delta_pred[mask_has_signal], delta_true[mask_has_signal], dim=1)
+        loss_cosine = 1.0 - cos_sim.mean()
+    else:
+        loss_cosine = torch.tensor(0.0, device=device)
+
+    # control loss: ELBO + cosine
+    control_loss = alpha * (loss_feat + loss_cosine) + beta * kl_div
+
+    # mmd for perturbed cells ancd control cells
+    loss_mmd_x = torch.tensor(0.0, device=device)
+    loss_mmd_y = compute_mmd(y_true, y_pred)
+
+    if mmd_gamma != 0.0:
+        loss_mmd_x = compute_mmd(x_true, x_pred)
+
+    total_loss = control_loss + loss_mmd_y + mmd_gamma * loss_mmd_x
+
+    return total_loss, loss_mmd_y, loss_mmd_x, kl_div, loss_cosine, loss_feat
+
+@torch.no_grad()
+def test_perturb_model(model, loader, device, wmse=True):
+    model.eval()
+    feat_err = []
+    for i, data in enumerate(tqdm(loader, desc='testing with WMSE...')):
+        x, y, pert = data
+        x, y, pert = x.to(device), y.to(device), pert.to(device)
+
+        y_hat, _ = model((x,pert)) #[B*N,1]
+        y_flat = y.reshape(-1, 1) #[B*N,1]
+
+        if wmse:
+            batch_size = pert.shape[0]
+            pert_idx = pert[0].int().argmax().item() #TODO: one-hot (does not expect more True values)
+            weights = model.weight_lookup[pert_idx].to(device).reshape(-1) #[N]
+
+            squared_error = (y_hat - y_flat).pow(2).reshape(batch_size, -1) #[B,N]
+            loss_per_cell = torch.sum(squared_error * weights.unsqueeze(0), dim=1)
+            error = torch.mean(loss_per_cell)
+        else:
+            error = F.mse_loss(y_hat, y_flat)
+        feat_err.append(error.item())
+
+    avg_feat_err = sum(feat_err)/len(feat_err)
+    return avg_feat_err
+
+
+def train(model, train_loader, test_loader, lr, n_epochs, device, live_plot):
+    global_loss = []
+    mmd_pert = []
+    mmd_ctrl = []
+    test_wmse = []
+    
+    accumulation_steps = 2
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, fused=True, weight_decay=0.0001)
+
+    weights_dir = 'weights'
+    os.makedirs(weights_dir, exist_ok=True)
+
+    for epoch in range(1, n_epochs + 1):
+        model.train()
+
+        total_loss = 0
+        total_mmd_pert = 0
+        total_mmd_ctrl = 0
+
+        optimizer.zero_grad(set_to_none=True)
+        for (i,batch) in enumerate(tqdm(train_loader, desc=f'training at epoch {epoch}')):
+            
+            loss, loss_mmd_y, loss_mmd_x, kl_div, loss_cosine, loss_feat = train_step_perturb_model(
+                model, 
+                batch, 
+                model.device, 
+                alpha=1.0, 
+                beta=_get_beta_schedule(epoch, n_epochs))
+            
+            loss.backward()
+            total_loss += loss.item()
+            total_mmd_pert += loss_mmd_y.item()
+            total_mmd_ctrl += loss_mmd_x.item()
+
+            if (i+1)%accumulation_steps==0:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+        
+        global_loss.append(total_loss/len(train_loader))
+        mmd_pert.append(total_mmd_pert/len(train_loader))
+        mmd_ctrl.append(total_mmd_ctrl/len(train_loader))
+
+        filepath = os.path.join(weights_dir, f"temp_weights_epoch_{epoch}.pth")
+        torch.save(model.state_dict(), filepath)
+        
+        if epoch!=0:
+
+            avg_feat_err = test_perturb_model(model, test_loader, model.device)
+            test_wmse.append(avg_feat_err)
+
+            if live_plot:
+                epoch_axis = list(range(1, epoch + 1))
+                clear_output(wait=True) 
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 16))       
+                ax1.plot(epoch_axis, global_loss, linestyle= '-', label='Loss')
+                ax1.plot(epoch_axis, mmd_pert, label='Perturb cells MMD')
+                ax1.plot(epoch_axis, mmd_ctrl, label='Control cells MMD')
+                ax1.set_title('Training')
+                ax1.set_xlabel('Epoch')
+                ax1.xaxis.set_major_locator(MaxNLocator(integer=True))
+                ax1.set_xlim(1, n_epochs)
+                ax1.legend(frameon=False)
+                ax1.grid(True)
+
+                ax2.plot(epoch_axis, test_wmse, linewidth=1.2, label='validation WMSE')
+                ax2.set_title('Validation')
+                ax2.set_xlabel('Epoch')
+                ax2.set_ylabel('WMSE')
+                ax2.xaxis.set_major_locator(MaxNLocator(integer=True))
+                ax2.set_xlim(1, n_epochs)
+                ax2.legend(frameon=False)
+                ax2.grid(True)
+
+                plt.tight_layout()
+                plt.savefig('plot_v2.png', dpi=300, bbox_inches='tight')
+                display(fig)   
+                plt.close(fig) 
+            
+    return mmd_pert, mmd_ctrl, test_wmse

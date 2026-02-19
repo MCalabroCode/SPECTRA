@@ -197,6 +197,7 @@ def wmse_loss(pred, y, perts, weight_dict, device='cuda'):
 
 ########################################################## new code ##############################
 
+# ref code for WMSE as implemented by Mejia et al.
 def wmse(x1, x2, weights):
     weights_arr = np.array(weights)
     x1_arr = np.array(x1)
@@ -295,8 +296,8 @@ def compute_weights(adata, gene_to_idx, cells_per_pert=256, score_type = 'scores
     adata_n_cells = []
     unique_perts = adata.obs['target_gene'].unique()
     for pert in unique_perts:
-        # if pert == 'non-targeting': 
-        #     continue # Skip control for the training weight calculation (usually)
+        if pert == 'non-targeting': 
+            continue # Skip control for the training weight calculation (usually)
 
         # cell indices    
         pert_idx = adata.obs_names[adata.obs['target_gene'] == pert]
@@ -352,4 +353,3 @@ def compute_weights(adata, gene_to_idx, cells_per_pert=256, score_type = 'scores
         final_weight_dict[gene_to_idx[pert]] = weights.values # TODO: adapt for multiple perturbations!! (I think it is enough to just build the dictionary with perturbations as keys, and not the genes!)
 
     return final_weight_dict
-    # FIXME: Ensure weights add up to 1 for each perturbation in the final computation of the WMSE

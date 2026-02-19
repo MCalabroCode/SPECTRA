@@ -9,4 +9,5 @@
 /vcc
 /depmap
 /Patrick_networks
+/weights
 *.pth

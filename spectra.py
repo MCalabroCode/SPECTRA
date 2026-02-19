@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from IPython.display import clear_output, display
 from tqdm import tqdm
 from matplotlib.ticker import MaxNLocator
-
+import os
 import torch
 import torch.nn.functional as F
 from torch_geometric.nn import ChebConv, DirGNNConv
@@ -175,7 +175,7 @@ class PerturbModel(torch.nn.Module):
         kl_per_dim_clamped = torch.clamp(kl_per_dim, min=free_bits)
         return torch.sum(kl_per_dim_clamped)
 
-    def forward(self, data):
+    def forward(self, data, return_latent=True):
 
         x, pert = data
         x = x.to(self.device) #[B,N,1]
@@ -215,9 +215,26 @@ class PerturbModel(torch.nn.Module):
         self.last_logstd = logstd  
 
         z = self.reparametrize(mu, logstd)
+
+        # # latent space
+        # if return_latent:
+        #     mean_z = z.mean(dim=0).detach().cpu().numpy()        
+
         self.last_z = z
-        z = torch.where(pert.unsqueeze(1), self.ko_token, z)
+
+        # z = torch.where(pert.unsqueeze(1), self.ko_token, z)
+        
+        # additive logic:
+        mask = pert.unsqueeze(1).to(z.dtype)
+        z = z + (mask * self.ko_token)
+
         z = self.gex_decoder(z, edge_index_batch)
+
+        # if return_latent:
+        #     return z, mean_z
+        # else:
+        #     return z
+        
         return z
 
 
@@ -381,7 +398,7 @@ def train_step_perturb_model(model, data, device, alpha=1., beta=1., mmd_gamma=1
     total_loss = (alpha * loss_feat + 
                 alpha * loss_cosine + 
                 mmd_gamma * loss_mmd)# + beta * kl_div)
-    total_loss = alpha * loss_feat + alpha * loss_cosine + beta * kl_div
+    # total_loss = alpha * loss_feat + alpha * loss_cosine + beta * kl_div
 
     return total_loss, loss_feat, kl_div
 
@@ -427,6 +444,9 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, live_plot):
     accumulation_steps = 2
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, fused=True, weight_decay=0.0001)
 
+    weights_dir = 'weights'
+    os.makedirs(weights_dir, exist_ok=True)
+
     for epoch in range(1, n_epochs + 1):
         model.train()
         total_feat = 0
@@ -452,7 +472,8 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, live_plot):
         feat_train_loss.append(avg_feat)
         kl_train_loss.append(avg_kl)
 
-        torch.save(model.state_dict(), f"temp_weights_epoch_{epoch}.pth")
+        filepath = os.path.join(weights_dir, f"temp_weights_epoch_{epoch}.pth")
+        torch.save(model.state_dict(), filepath)
         
         if epoch!=0:
 
