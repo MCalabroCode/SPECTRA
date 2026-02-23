@@ -1,7 +1,3 @@
-#
-# new SPECTRA! Let's revolutionalize everything! LEETS F***ING GO
-#
-
 import numpy as np
 import matplotlib.pyplot as plt
 from IPython.display import clear_output, display
@@ -18,16 +14,16 @@ from torch.nn import ReLU, LeakyReLU, GELU, LayerNorm
 class VariationalGraphEncoder(torch.nn.Module):
     ''' encoder class
     '''
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, dropout_rate = 0.2):
         super().__init__()
         self.out_channels = out_channels
-        self.conv1 = DirGNNConv(ChebConv(in_channels, out_channels, 3)) 
+        self.conv1 = DirGNNConv(ChebConv(in_channels, out_channels, 2)) 
         self.ln1 = LayerNorm(out_channels)
-        self.conv2 = DirGNNConv(ChebConv(out_channels, 2*out_channels, 3))
+        self.conv2 = DirGNNConv(ChebConv(out_channels, 2*out_channels, 2))
         self.ln2 = LayerNorm(2*out_channels)
         self.conv_mu = DirGNNConv(ChebConv(2*out_channels, out_channels, 2))  
         self.conv_logstd = DirGNNConv(ChebConv(2*out_channels, out_channels, 2))
-        self.dropout_rate = 0.2
+        self.dropout_rate = dropout_rate
 
     def forward(self, x, edge_index):
         x = F.dropout(x, p=self.dropout_rate, training=self.training)
@@ -70,14 +66,14 @@ class FeatureDecoder(torch.nn.Module):
     ''' 
     Feature decoder
     '''
-    def __init__(self, n_channels, num_node_features):
+    def __init__(self, n_channels, num_node_features, dropout_rate=0.1):
         super().__init__()
-        self.conv1 = DirGNNConv(ChebConv(n_channels, n_channels, 3))
+        self.conv1 = DirGNNConv(ChebConv(n_channels, n_channels, 2))
         self.ln1 = LayerNorm(n_channels)
-        self.conv2 = DirGNNConv(ChebConv(n_channels, n_channels, 3))
+        self.conv2 = DirGNNConv(ChebConv(n_channels, n_channels, 2))
         self.ln2 = LayerNorm(n_channels)
-        self.dropout_rate = 0.2
-        self.last_layer = MLP([n_channels, n_channels, 1], dropout=0.1)
+        self.dropout_rate = dropout_rate
+        self.last_layer = torch.nn.Linear(n_channels, num_node_features) 
 
     def forward(self, z, edge_index):
         z = F.dropout(z, p=self.dropout_rate, training=self.training)
@@ -90,13 +86,13 @@ class FeatureDecoder(torch.nn.Module):
         z = self.ln2(z)
         z = F.gelu(z)
         
-        return self.last_layer(z)
+        return F.softplus(self.last_layer(z))
 
 class PerturbModel(torch.nn.Module):
     '''
     SPECTRA model class
     '''
-    def __init__(self, edge_index, num_nodes, device, gene_weights=None, num_node_features=1, n_channels=32, edge_dropout_p=0.2):
+    def __init__(self, edge_index, num_nodes, device, gene_weights=None, num_node_features=1, n_channels=32, edge_dropout_p=0.1):
         super().__init__()
         self.device = device 
         self.num_nodes = num_nodes 
@@ -104,30 +100,24 @@ class PerturbModel(torch.nn.Module):
         self.register_buffer('edge_index', edge_index)
         self.edge_dropout_p = edge_dropout_p
 
-        # Weight Lookup Construction. We need N+1 rows. The last row (index N) is for control (gene_weights[-1]).
-        default_weights = gene_weights.get(-1) if gene_weights.get(-1) is not None else (1/num_nodes)*torch.ones(num_nodes)
+        # Weight Lookup Construction for WMSE
+        default_weights = (1/num_nodes)*torch.ones(num_nodes)
         weight_lookup = default_weights.unsqueeze(0).repeat(num_nodes + 1, 1).to(device)    
         if isinstance(gene_weights, dict):
             for pert_idx, weight_array in gene_weights.items():
                 w_tensor = torch.tensor(weight_array, dtype=torch.float32, device=device)
-                if pert_idx == -1:
-                    weight_lookup[num_nodes] = w_tensor # Explicitly set the control row (index N)
-                elif 0 <= pert_idx < num_nodes:
+                if 0 <= pert_idx < num_nodes:
                     weight_lookup[pert_idx] = w_tensor
         self.register_buffer('weight_lookup', weight_lookup)
 
-        # # Project & Add Architecture
-        # self.embedding_dim = 64 
-        # self.gene_embedding = torch.nn.Embedding(num_nodes, self.embedding_dim)
-        
-        # # Project scalar GEX to matching dimension
-        # self.gex_projection = torch.nn.Linear(num_node_features, self.embedding_dim)
-        
-        # Input to encoder is embedding_dim (because we add them, not concat)
-        self.encoder_in_channels = 1#self.embedding_dim
+        self.encoder_in_channels = 1
 
         # Learnable KO perturbation Token
-        self.ko_token = torch.nn.Parameter(torch.randn(1, n_channels) - 2.0)
+        # self.ko_token = torch.nn.Parameter(torch.randn(1, n_channels) - 2.0)
+        self.ko_mu = torch.nn.Embedding(num_nodes, n_channels)
+        self.ko_sigma = torch.nn.Embedding(num_nodes, n_channels)
+        torch.nn.init.normal_(self.ko_mu.weight, mean=-2.0, std=0.5) # Match your original prior for the mean shift (-2.0)
+        torch.nn.init.zeros_(self.ko_sigma.weight) # Initialize variance scale weights to 0 so that exp(0) = 1.0 (identity scale)
 
         self.encoder = VariationalGraphEncoder(self.encoder_in_channels, n_channels)
         self.gex_decoder = FeatureDecoder(n_channels, num_node_features)
@@ -184,19 +174,7 @@ class PerturbModel(torch.nn.Module):
         batch_size, num_nodes, num_features = x.shape
 
         edge_index_batch = self._get_batched_edge_index(batch_size)
-
         x = x.reshape(batch_size * num_nodes, num_features) #[BxN,1]
-
-        # # Project GEX
-        # gex_vec = self.gex_projection(x) # [B*N, 64]
-
-        # # Get Embedding
-        # gene_ids = self._get_batched_gene_ids(batch_size)
-        # emb = self.gene_embedding(gene_ids) # [B*N, 64]
-
-        # # Add
-        # x_input = gex_vec + emb 
-
         pert = pert.reshape(batch_size * num_nodes) #[BxN]
 
         # Edge Dropout
@@ -214,16 +192,46 @@ class PerturbModel(torch.nn.Module):
         self.last_mu = mu          
         self.last_logstd = logstd  
 
-        z = self.reparametrize(mu, logstd)     
-
-        self.last_z = z
-        x_hat = self.gex_decoder(z, edge_index_batch)
+        z_ctrl = self.reparametrize(mu, logstd)     
+        self.last_z = z_ctrl
+        x_hat = self.gex_decoder(z_ctrl, edge_index_batch)
         
-        # additive logic:
-        mask = pert.unsqueeze(1).to(z.dtype)
-        z = z + (mask * self.ko_token)
+        # # additive logic for perturbation encoding
+        # mask = pert.unsqueeze(1).to(z.dtype)
+        # z = z + (mask * self.ko_token)
 
-        y_hat = self.gex_decoder(z, edge_index_batch)
+        # #NOTE:learnable generic gene-specific function with variance scaling
+        # pert_mask = pert.bool()
+        # gene_ids = self._get_batched_gene_ids(batch_size)
+        # perturbed_gene_ids = gene_ids[pert_mask]
+        # mu_shift = self.ko_mu(perturbed_gene_ids)
+        # sigma_scale = torch.exp(self.ko_sigma(perturbed_gene_ids))
+        # z_pert = z[pert_mask]
+        # mu_pert = mu[pert_mask]
+        # z_pert_scaled = mu_pert + (z_pert - mu_pert) * sigma_scale + mu_shift
+        # delta_z = torch.zeros_like(z)
+        # delta_z[pert_mask] = z_pert_scaled - z_pert
+        # z = z + delta_z
+
+        pert_mask = pert.bool()
+        delta_mu = torch.zeros_like(mu)
+        delta_logstd = torch.zeros_like(logstd)
+        
+        if pert_mask.any():
+            gene_ids = self._get_batched_gene_ids(batch_size)
+            perturbed_gene_ids = gene_ids[pert_mask]
+            
+            # Lookup shifts (No torch.exp needed for logstd addition!)
+            mu_shift = self.ko_mu(perturbed_gene_ids)
+            logstd_shift = self.ko_sigma(perturbed_gene_ids) 
+            
+            delta_mu[pert_mask] = mu_shift
+            delta_logstd[pert_mask] = logstd_shift
+            
+        mu_pert = mu + delta_mu
+        logstd_pert = logstd + delta_logstd
+        z_pert = self.reparametrize(mu_pert, logstd_pert)
+        y_hat = self.gex_decoder(z_pert, edge_index_batch)
         
         return y_hat, x_hat
 
@@ -231,30 +239,13 @@ class PerturbModel(torch.nn.Module):
     def predict_full_expression(self, data):
         self.eval()
         return self.forward(data)[0]
-    
-    def generative_prediction(self, ko_gene_idx, n_samples=1):
-        self.eval()
-        with torch.no_grad():
-
-            # Support batched generation
-            z_basal = torch.randn(self.num_nodes * n_samples, self.n_channels).to(self.device)
-            
-            z_perturbed = z_basal.clone()
-            
-            # Apply KO token to specific indices
-            offsets = torch.arange(n_samples, device=self.device) * self.num_nodes
-            flat_ko_indices = ko_gene_idx + offsets
-            z_perturbed[flat_ko_indices, :] = self.ko_token
-            
-            edge_index_batch = self._get_batched_edge_index(n_samples)
-
-            predicted_expression = self.gex_decoder(z_perturbed, edge_index_batch)[0]
-            predicted_expression = predicted_expression.reshape(n_samples, self.num_nodes)
-            return predicted_expression
 
 ######### training + testing routines ##########
 
 def _get_beta_schedule(epoch, n_epochs, n_cycles=1, ratio=0.5):
+    '''
+    beta schefuler for the VAE (beta-Vae)
+    '''
     period = n_epochs // n_cycles 
     step = epoch % period
     if step < period * ratio:
@@ -327,14 +318,19 @@ def train_step_perturb_model(model, data, device, alpha=1., beta=1., mmd_gamma=0
     x_pred = x_hat.view(B, N)
     y_pred = y_hat.view(B, N)
 
-    delta_true = y_true - x_true
-    delta_pred = y_pred - x_pred
+    # Compute pseudobulk - used for proper cosine similarity
+    x_true_mean = x_true.mean(dim=0) # [N]
+    y_true_mean = y_true.mean(dim=0) # [N]
+    x_pred_mean = x_pred.mean(dim=0) # [N]
+    y_pred_mean = y_pred.mean(dim=0) # [N]
 
-    true_norm = torch.norm(delta_true, dim=1)
-    mask_has_signal = true_norm > 1e-6
-    if mask_has_signal.any():
-        cos_sim = F.cosine_similarity(delta_pred[mask_has_signal], delta_true[mask_has_signal], dim=1)
-        loss_cosine = 1.0 - cos_sim.mean()
+    delta_true_mean = y_true_mean - x_true_mean
+    delta_pred_mean = y_pred_mean - x_pred_mean
+
+    true_norm = torch.norm(delta_true_mean)
+    if true_norm > 1e-6:
+        cos_sim = F.cosine_similarity(delta_pred_mean, delta_true_mean, dim=0)
+        loss_cosine = 1.0 - cos_sim
     else:
         loss_cosine = torch.tensor(0.0, device=device)
 
@@ -365,7 +361,7 @@ def test_perturb_model(model, loader, device, wmse=True):
 
         if wmse:
             batch_size = pert.shape[0]
-            pert_idx = pert[0].int().argmax().item() #TODO: one-hot (does not expect more True values)
+            pert_idx = pert[0].int().argmax().item() #TODO: one-hot (does not expect more True values - doesn't adapt to multiple perturbations)
             weights = model.weight_lookup[pert_idx].to(device).reshape(-1) #[N]
 
             squared_error = (y_hat - y_flat).pow(2).reshape(batch_size, -1) #[B,N]
@@ -400,7 +396,6 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, live_plot):
 
         optimizer.zero_grad(set_to_none=True)
         for (i,batch) in enumerate(tqdm(train_loader, desc=f'training at epoch {epoch}')):
-            
             loss, loss_mmd_y, loss_mmd_x, kl_div, loss_cosine, loss_feat = train_step_perturb_model(
                 model, 
                 batch, 
@@ -429,6 +424,7 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, live_plot):
             avg_feat_err = test_perturb_model(model, test_loader, model.device)
             test_wmse.append(avg_feat_err)
 
+            # routine for plotting traning/testing metrics during the training
             if live_plot:
                 epoch_axis = list(range(1, epoch + 1))
                 clear_output(wait=True) 

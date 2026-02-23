@@ -10,4 +10,5 @@
 /depmap
 /Patrick_networks
 /weights
+/results
 *.pth
