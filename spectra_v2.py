@@ -11,6 +11,8 @@ from torch_geometric.utils import dropout_edge
 from torch.nn import ReLU, LeakyReLU, GELU, LayerNorm
 from magnet import MagNetConv
 
+import wandb
+
 # class VariationalGraphEncoder(torch.nn.Module):
 #     def __init__(self, in_channels, out_channels, dropout_rate=0.2, q=0.25, K=2):
 #         super().__init__()
@@ -171,6 +173,8 @@ class FeatureDecoder(torch.nn.Module):
         self.dropout_rate = dropout_rate
         self.last_layer = torch.nn.Linear(n_channels, num_node_features) 
 
+        #torch.nn.init.constant_(self.last_layer.bias, 1.0)
+
     def forward(self, z, edge_index):
         z = F.dropout(z, p=self.dropout_rate, training=self.training)
         z = self.conv1(z, edge_index)
@@ -181,8 +185,12 @@ class FeatureDecoder(torch.nn.Module):
         z = self.conv2(z, edge_index)
         z = self.ln2(z)
         z = F.gelu(z)
-        
-        return F.softplus(self.last_layer(z))
+
+        out = self.last_layer(z)
+        if self.training:
+            return F.leaky_relu(out, negative_slope=0.05) 
+        else:
+            return F.relu(out)
 
 
 class PerturbModel(torch.nn.Module):
@@ -211,14 +219,17 @@ class PerturbModel(torch.nn.Module):
         self.encoder_in_channels = 1
 
         # Learnable KO perturbation Token
-        #self.ko_token = torch.nn.Parameter(torch.randn(1, n_channels) - 2.0)
-        self.ko_mu = torch.nn.Embedding(num_nodes, n_channels)
-        self.ko_sigma = torch.nn.Embedding(num_nodes, n_channels)
-        torch.nn.init.normal_(self.ko_mu.weight, mean=-2.0, std=0.5) # Match your original prior for the mean shift (-2.0)
-        torch.nn.init.zeros_(self.ko_sigma.weight) # Initialize variance scale weights to 0 so that exp(0) = 1.0 (identity scale)
+        # #self.ko_token = torch.nn.Parameter(torch.randn(1, n_channels) - 2.0)
+        # self.ko_mu = torch.nn.Embedding(num_nodes, n_channels)
+        # self.ko_sigma = torch.nn.Embedding(num_nodes, n_channels)
+        # torch.nn.init.normal_(self.ko_mu.weight, mean=-2.0, std=0.5) # Match your original prior for the mean shift (-2.0)
+        # torch.nn.init.zeros_(self.ko_sigma.weight) # Initialize variance scale weights to 0 so that exp(0) = 1.0 (identity scale)
 
         # self.ko_token = torch.nn.Embedding(1,n_channels)
         # torch.nn.init.xavier_uniform_(self.ko_token.weight)
+
+        self.ko_mu = torch.nn.Embedding(num_nodes, 64)
+        self.ko_mlp = MLP([64, n_channels, n_channels])
 
         self.encoder = VariationalGraphEncoder(self.encoder_in_channels, n_channels)
         self.gex_decoder = FeatureDecoder(n_channels, num_node_features)
@@ -307,22 +318,31 @@ class PerturbModel(torch.nn.Module):
         #z = z + (mask * self.ko_token)
 
         #NOTE:learnable generic gene-specific function with variance scaling
+        # pert_mask = pert.bool()
+        # delta_mu = torch.zeros_like(mu)
+        # delta_logstd = torch.zeros_like(logstd)
+        
+        # if pert_mask.any():
+        #     gene_ids = self._get_batched_gene_ids(batch_size)
+        #     perturbed_gene_ids = gene_ids[pert_mask]
+            
+        #     # Lookup shifts (No torch.exp needed for logstd addition!)
+        #     mu_shift = self.ko_mu(perturbed_gene_ids)
+        #     logstd_shift = self.ko_sigma(perturbed_gene_ids) 
+            
+        #     delta_mu[pert_mask] = mu_shift
+        #     delta_logstd[pert_mask] = logstd_shift
+
         pert_mask = pert.bool()
         delta_mu = torch.zeros_like(mu)
-        delta_logstd = torch.zeros_like(logstd)
-        
         if pert_mask.any():
             gene_ids = self._get_batched_gene_ids(batch_size)
             perturbed_gene_ids = gene_ids[pert_mask]
-            
-            # Lookup shifts (No torch.exp needed for logstd addition!)
-            mu_shift = self.ko_mu(perturbed_gene_ids)
-            logstd_shift = self.ko_sigma(perturbed_gene_ids) 
-            
+            ko_embeddings = self.ko_mu(perturbed_gene_ids)
+            mu_shift = self.ko_mlp(ko_embeddings)
             delta_mu[pert_mask] = mu_shift
-            delta_logstd[pert_mask] = logstd_shift
         mu_pert = mu + delta_mu
-        logstd_pert = logstd + delta_logstd
+        logstd_pert = logstd #+ delta_logstd
         z_pert = self.reparametrize(mu_pert, logstd_pert)
         y_hat = self.gex_decoder(z_pert, edge_index_batch)
 
@@ -349,7 +369,7 @@ class PerturbModel(torch.nn.Module):
 
 ######### training + testing routines ##########
 
-def _get_beta_schedule(epoch, n_epochs, warmup_epochs=7, n_cycles=1, ratio=0.5):
+def _get_beta_schedule(epoch, n_epochs, warmup_epochs=5, n_cycles=1, ratio=0.5):
     '''
     beta schefuler for the VAE (beta-Vae)
 
@@ -380,7 +400,7 @@ def _get_beta_schedule(epoch, n_epochs, warmup_epochs=7, n_cycles=1, ratio=0.5):
     else:
         return 1.0
 
-def compute_mmd_withcosine(x, y, kernel_mul=2.0, kernel_num=5, fix_sigma=None, lambda_cos=0.5):
+def compute_mmd_withcosine(x, y, weights=None, kernel_mul=2.0, kernel_num=5, fix_sigma=None, lambda_cos=0.0):
     """
     Computes the Maximum Mean Discrepancy (MMD) between two batches.
     Uses a composite kernel: (1 - lambda_cos) * Multi-RBF + lambda_cos * Cosine
@@ -398,7 +418,13 @@ def compute_mmd_withcosine(x, y, kernel_mul=2.0, kernel_num=5, fix_sigma=None, l
     # ---------------------------------------------------------
     # 1. RBF Kernel Calculation (Spatial)
     # ---------------------------------------------------------
-    L2_distance = torch.cdist(total, total, p=2)**2
+    if weights is not None:
+        # Scale features so that squared L2 distance naturally becomes WMSE
+        total_scaled = total * torch.sqrt(weights.unsqueeze(0))
+    else:
+        total_scaled = total
+    L2_distance = torch.cdist(total_scaled, total_scaled, p=2)**2
+    #L2_distance = torch.cdist(total, total, p=2)**2
     
     if fix_sigma:
         bandwidth = fix_sigma
@@ -463,7 +489,7 @@ def compute_mmd(x, y, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
     if fix_sigma:
         bandwidth = fix_sigma
     else:
-        bandwidth = torch.sum(L2_distance.detach()) / (n_samples**2 - n_samples)
+        bandwidth = torch.sum(L2_distance.detach()) / (n_samples**2 - n_samples) + 1e-5
     bandwidth /= kernel_mul ** (kernel_num // 2)
     bandwidth_list = [bandwidth * (kernel_mul**i) for i in range(kernel_num)]
     
@@ -504,6 +530,10 @@ def train_step_perturb_model(model, data, device, alpha=1., beta=1., mmd_gamma=0
     x_pred = x_hat.view(B, N)
     y_pred = y_hat.view(B, N)
 
+    # ---- NEW: Extract perturbation weights for this batch ----
+    pert_idx = pert[0].int().argmax().item()
+    batch_weights = model.weight_lookup[pert_idx].to(device).reshape(-1)
+
     # Compute pseudobulk - used for proper cosine similarity
     x_true_mean = x_true.mean(dim=0) # [N]
     y_true_mean = y_true.mean(dim=0) # [N]
@@ -525,7 +555,7 @@ def train_step_perturb_model(model, data, device, alpha=1., beta=1., mmd_gamma=0
 
     # mmd for perturbed cells ancd control cells
     loss_mmd_x = torch.tensor(0.0, device=device)
-    loss_mmd_y = compute_mmd_withcosine(y_true, y_pred)
+    loss_mmd_y = compute_mmd_withcosine(y_true, y_pred, weights=batch_weights)
 
     if mmd_gamma != 0.0:
         loss_mmd_x = compute_mmd(x_true, x_pred)
@@ -570,7 +600,8 @@ def test_perturb_model(model, loader, device, wmse=True):
     return avg_feat_err, avg_pert_mmd
 
 
-def train(model, train_loader, test_loader, lr, n_epochs, device, live_plot):
+def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support, live_plot):
+
     global_loss = []
     mmd_pert = []
     mmd_ctrl = []
@@ -582,15 +613,19 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, live_plot):
     weights_dir = 'weights'
     os.makedirs(weights_dir, exist_ok=True)
 
+    # wandb watch
+    if wandb_support:
+        wandb.watch(model, log="all", log_freq=10) # log="all" tracks both gradients and parameters
+
     for epoch in range(1, n_epochs + 1):
         model.train()
 
         total_loss = 0
         total_mmd_pert = 0
         total_mmd_ctrl = 0
-        kl = 0
-        mse = 0
-        cos = 0
+        kl_accum = 0
+        mse_accum = 0
+        cos_accum = 0
 
         optimizer.zero_grad(set_to_none=True)
         for (i,batch) in enumerate(tqdm(train_loader, desc=f'training at epoch {epoch}')):
@@ -598,36 +633,46 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, live_plot):
                 model, 
                 batch, 
                 model.device, 
-                alpha=1.0, 
-                beta=1.)
+                alpha=2.0, 
+                beta=0.1)
             
             loss.backward()
+
+            # sum, we will calculate the mean over all the epoch
             total_loss += loss.item()
             total_mmd_pert += loss_mmd_y.item()
             total_mmd_ctrl += loss_mmd_x#.item()
-
-            kl += kl_div.item()
-            mse += loss_feat.item()
-            cos += loss_cosine.item()
-
+            kl_accum += kl_div.item()
+            mse_accum += loss_feat.item()
+            cos_accum += loss_cosine.item()
+            
+            # gradient accumulation
             if (i+1)%accumulation_steps==0:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-        global_loss.append(total_loss/len(train_loader))
-        mmd_pert.append(total_mmd_pert/len(train_loader))
-        mmd_ctrl.append(total_mmd_ctrl/len(train_loader))
+        # calculate averages for the epoch
+        epoch_loss = total_loss / len(train_loader)
+        epoch_mmd_pert = total_mmd_pert / len(train_loader)
+        epoch_mmd_ctrl = total_mmd_ctrl / len(train_loader)
+        epoch_kl = kl_accum / len(train_loader)
+        epoch_mse = mse_accum / len(train_loader)
+        epoch_cos = cos_accum / len(train_loader)
 
-        kl = kl/len(train_loader)
-        mse = mse/len(train_loader)
-        cos = cos/len(train_loader)
-        print(f'training KL = {kl:.5f} | mse = {mse:.3f} | cos = {cos:.3f}')
+        # Append to lists
+        global_loss.append(epoch_loss)
+        mmd_pert.append(epoch_mmd_pert)
+        mmd_ctrl.append(epoch_mmd_ctrl)
 
+        # print training methods
+        print(f'training KL = {epoch_kl:.5f} | mse = {epoch_mse:.3f} | cos = {epoch_cos:.3f}')
+
+        # save current epoch weights
         filepath = os.path.join(weights_dir, f"temp_weights_epoch_{epoch}.pth")
         torch.save(model.state_dict(), filepath)
         
+        # validation
         if epoch!=0:
-
             _, avg_feat_err = test_perturb_model(model, test_loader, model.device)
             test_wmse.append(avg_feat_err)
 
@@ -659,5 +704,24 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, live_plot):
                 plt.savefig('plot_v2.png', dpi=300, bbox_inches='tight')
                 display(fig)   
                 plt.close(fig) 
-            
+        
+        # wandb support
+        if wandb_support:
+            log_metrics = {
+                "epoch": epoch,
+                "train/global_loss": epoch_loss,
+                "train/mmd_pert": epoch_mmd_pert,
+                "train/mmd_ctrl": epoch_mmd_ctrl,
+                "train/kl_divergence": epoch_kl,
+                "train/mse": epoch_mse,
+                "train/cosine_loss": epoch_cos,
+            }
+
+            # Only log validation metric if it was calculated
+            if avg_feat_err is not None:
+                log_metrics["val/test_wmse"] = avg_feat_err
+                
+            wandb.log(log_metrics)
+
+
     return mmd_pert, mmd_ctrl, test_wmse
