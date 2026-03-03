@@ -45,7 +45,7 @@ class MagNetConv(torch.nn.Module):
         # Symmetrized A_sym = 0.5 * (A + A^T)
         edge_index_sym, edge_weight_sym = pyg_utils.to_undirected(
             edge_index, edge_weight, num_nodes=num_nodes, reduce='add'
-        )
+        ) #this orders by rows because it calls pyg_utils.coalesce
         edge_weight_sym = edge_weight_sym * 0.5
         
         # Degree Matrix D
@@ -70,7 +70,16 @@ class MagNetConv(torch.nn.Module):
             reduce='add'
         )
         
-        theta = 2 * math.pi * self.q * val_diff
+        # Build a lookup: (row, col) -> val_diff
+        diff_idx = edge_index_diff[0] * num_nodes + edge_index_diff[1]
+        sym_idx  = edge_index_sym[0]  * num_nodes + edge_index_sym[1]
+
+        # Map diff values onto sym edge ordering
+        order = torch.searchsorted(diff_idx, sym_idx)
+        theta_vals = val_diff[order]  # now aligned with edge_index_sym
+        theta = 2 * math.pi * self.q * theta_vals
+        
+        #theta = 2 * math.pi * self.q * val_diff
         
         # 5. Scaled Laplacian L = -exp(i * Theta) * A_sym
         L_real_val = -torch.cos(theta) * edge_weight_sym_norm

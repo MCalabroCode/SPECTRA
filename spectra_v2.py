@@ -168,15 +168,17 @@ class FeatureDecoder(torch.nn.Module):
         super().__init__()
         self.conv1 = DirGNNConv(SAGEConv(n_channels, n_channels))
         self.ln1 = LayerNorm(n_channels)
-        self.conv2 = DirGNNConv(SAGEConv(n_channels, n_channels))
-        self.ln2 = LayerNorm(n_channels)
+        self.conv2 = DirGNNConv(SAGEConv(n_channels, 2*n_channels))
+        self.ln2 = LayerNorm(2*n_channels)
+        self.conv3 = DirGNNConv(SAGEConv(2*n_channels, n_channels))
+        self.ln3 = LayerNorm(n_channels)
         self.dropout_rate = dropout_rate
         self.last_layer = torch.nn.Linear(n_channels, num_node_features) 
 
         #torch.nn.init.constant_(self.last_layer.bias, 1.0)
 
     def forward(self, z, edge_index):
-        z = F.dropout(z, p=self.dropout_rate, training=self.training)
+        #z = F.dropout(z, p=self.dropout_rate, training=self.training)
         z = self.conv1(z, edge_index)
         z = self.ln1(z)
         z = F.gelu(z)
@@ -184,6 +186,11 @@ class FeatureDecoder(torch.nn.Module):
         z = F.dropout(z, p=self.dropout_rate, training=self.training)
         z = self.conv2(z, edge_index)
         z = self.ln2(z)
+        z = F.gelu(z)
+
+        z = F.dropout(z, p=self.dropout_rate, training=self.training)
+        z = self.conv3(z, edge_index)
+        z = self.ln3(z)
         z = F.gelu(z)
 
         out = self.last_layer(z)
@@ -634,7 +641,7 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
                 batch, 
                 model.device, 
                 alpha=2.0, 
-                beta=0.1)
+                beta=0.01)
             
             loss.backward()
 
