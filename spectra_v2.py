@@ -114,12 +114,12 @@ class VariationalGraphEncoder(torch.nn.Module):
     def __init__(self, in_channels, out_channels, dropout_rate = 0.2):
         super().__init__()
         self.out_channels = out_channels
-        self.conv1 = DirGNNConv(SAGEConv(in_channels, out_channels)) 
+        self.conv1 = DirGNNConv(ChebConv(in_channels, out_channels, 3)) 
         self.ln1 = LayerNorm(out_channels)
-        self.conv2 = DirGNNConv(SAGEConv(out_channels, 2*out_channels))
+        self.conv2 = DirGNNConv(ChebConv(out_channels, 2*out_channels, 3))
         self.ln2 = LayerNorm(2*out_channels)
-        self.conv_mu = DirGNNConv(SAGEConv(2*out_channels, out_channels))  
-        self.conv_logstd = DirGNNConv(SAGEConv(2*out_channels, out_channels))
+        self.conv_mu = DirGNNConv(ChebConv(2*out_channels, out_channels, 2))  
+        self.conv_logstd = DirGNNConv(ChebConv(2*out_channels, out_channels, 2))
         self.dropout_rate = dropout_rate
 
     def forward(self, x, edge_index):
@@ -166,11 +166,11 @@ class FeatureDecoder(torch.nn.Module):
     '''
     def __init__(self, n_channels, num_node_features, dropout_rate=0.1):
         super().__init__()
-        self.conv1 = DirGNNConv(SAGEConv(n_channels, n_channels))
+        self.conv1 = DirGNNConv(ChebConv(n_channels, n_channels, 2))
         self.ln1 = LayerNorm(n_channels)
-        self.conv2 = DirGNNConv(SAGEConv(n_channels, 2*n_channels))
+        self.conv2 = DirGNNConv(ChebConv(n_channels, 2*n_channels, 2))
         self.ln2 = LayerNorm(2*n_channels)
-        self.conv3 = DirGNNConv(SAGEConv(2*n_channels, n_channels))
+        self.conv3 = DirGNNConv(ChebConv(2*n_channels, n_channels, 2))
         self.ln3 = LayerNorm(n_channels)
         self.dropout_rate = dropout_rate
         self.last_layer = torch.nn.Linear(n_channels, num_node_features) 
