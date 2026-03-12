@@ -35,7 +35,7 @@ config = dict(
     test_ratio=0.2,
     val_ratio=0.1,
     batch_size=48,
-    n_channels=24,
+    n_channels=48,
     edge_dropout_p=0.0,
     lr=0.001,
     n_epochs=20,
@@ -46,7 +46,7 @@ config = dict(
 # Initialize wandb run
 wandb.init(
     project="spectra-v2",       # The name of your project in wandb
-    name="SkipConnections_full",   # (Optional) Name of this specific run
+    name="SkipConnections_full_48",   # (Optional) Name of this specific run
     config=config               # Pass your dictionary here!
 )
 
