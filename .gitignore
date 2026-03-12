@@ -8,8 +8,10 @@
 /test_18_december_filtering__64_embeddings__32d.pth
 /vcc
 /depmap
+/data
 /Patrick_networks
 /weights
 /results
 /wandb
+/echoes
 *.pth

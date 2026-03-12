@@ -31,7 +31,7 @@ print(device)
 
 # hyperparameters, metadata and stuff
 config = dict(
-    #dataset_size=170000,
+    dataset_size=50000,
     test_ratio=0.2,
     val_ratio=0.1,
     batch_size=48,
@@ -40,13 +40,14 @@ config = dict(
     lr=0.001,
     n_epochs=20,
     dataset="VCC",
-    architecture="ChebConv_no_edge_dropout")
+    architecture="DirGCNConv(ChebConv)")
 
 
 # Initialize wandb run
 wandb.init(
-    project="spectra-v2",
-    config=config
+    project="spectra-v2",       # The name of your project in wandb
+    name="SkipConnections_full",   # (Optional) Name of this specific run
+    config=config               # Pass your dictionary here!
 )
 
 
@@ -247,8 +248,7 @@ model = PerturbModel(
     device, 
     gene_weights=gene_weights, 
     num_node_features=1, 
-    n_channels=config['n_channels'], 
-    edge_dropout_p=config['edge_dropout_p']
+    n_channels=config['n_channels']
 )
 model = model.to(device)
 print(model)
@@ -269,5 +269,5 @@ _, _, test_wmse = train(model=model,
 
 
 ######### save and close
-torch.save(model.state_dict(), "test_4_mar.pth")
+torch.save(model.state_dict(), "test_11_mar__chebconv_skipcon.pth")
 wandb.finish()

@@ -9,104 +9,280 @@ import torch.nn.functional as F
 from torch_geometric.nn import ChebConv, DirGNNConv, SAGEConv
 from torch_geometric.utils import dropout_edge
 from torch.nn import ReLU, LeakyReLU, GELU, LayerNorm
-from magnet import MagNetConv
+from magnet import MagNetConv, precompute_magnet_attributes_sparse
 
 import wandb
+class MLP(torch.nn.Module):
+    '''
+    MLP auxiliary class
+    '''
+    def __init__(self, sizes, batch_norm=True, dropout=0.2):
+        super(MLP, self).__init__()
+        layers = []
+        for s in range(len(sizes) - 1):
+            layers = layers + [
+                torch.nn.Dropout(p=dropout),
+                torch.nn.Linear(sizes[s], sizes[s + 1]),
+                torch.nn.BatchNorm1d(sizes[s + 1])
+                if batch_norm and s < len(sizes) - 1 else None,
+                torch.nn.ReLU()
+            ]
+
+        layers = [l for l in layers if l is not None][:-1]
+        self.network = torch.nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.network(x)
 
 # class VariationalGraphEncoder(torch.nn.Module):
-#     def __init__(self, in_channels, out_channels, dropout_rate=0.2, q=0.25, K=2):
+#     def __init__(self, in_channels, out_channels, dropout_rate=0.2):
 #         super().__init__()
-#         self.conv1 = MagNetConv(in_channels, out_channels, K=K, q=q)
+#         self.out_channels = out_channels
+        
+#         # Replace ChebConv with MagNetConv
+#         self.conv1 = MagNetConv(in_channels, out_channels, K=3)
 #         self.ln1_real = LayerNorm(out_channels)
 #         self.ln1_imag = LayerNorm(out_channels)
         
-#         self.conv2 = MagNetConv(out_channels, 2*out_channels, K=K, q=q)
+#         self.conv2 = MagNetConv(out_channels, 2*out_channels, K=3)
 #         self.ln2_real = LayerNorm(2*out_channels)
 #         self.ln2_imag = LayerNorm(2*out_channels)
         
-#         # Concat logic requires 2*2*out_channels = 4*out_channels
-#         self.conv_mu = torch.nn.Linear(4*out_channels, out_channels)
-#         self.conv_logstd = torch.nn.Linear(4*out_channels, out_channels)
+#         self.conv_mu = MagNetConv(2*out_channels, out_channels, K=2)
+#         self.conv_logstd = MagNetConv(2*out_channels, out_channels, K=2)
 #         self.dropout_rate = dropout_rate
 
-#     def forward(self, x, edge_index):
-#         # Base expression is entirely real
-#         x_real = F.dropout(x, p=self.dropout_rate, training=self.training)
-#         x_imag = torch.zeros_like(x_real)
-        
-#         x_real, x_imag = self.conv1(x_real, x_imag, edge_index)
+#     def forward(self, x_real, x_imag, edge_index_sym, edge_weight_complex):
+#         x_real, x_imag = self.conv1(x_real, x_imag, edge_index_sym, edge_weight_complex)#norm, phase)
 #         x_real = F.gelu(self.ln1_real(x_real))
 #         x_imag = F.gelu(self.ln1_imag(x_imag))
+        
+#         x_real = F.dropout(x_real, p=self.dropout_rate, training=self.training)
+#         x_imag = F.dropout(x_imag, p=self.dropout_rate, training=self.training)
 
+#         x_real, x_imag = self.conv2(x_real, x_imag, edge_index_sym, edge_weight_complex)#norm, phase)
+#         x_real = F.gelu(self.ln2_real(x_real))
+#         x_imag = F.gelu(self.ln2_imag(x_imag)) 
+        
 #         x_real = F.dropout(x_real, p=self.dropout_rate, training=self.training)
 #         x_imag = F.dropout(x_imag, p=self.dropout_rate, training=self.training)
         
-#         x_real, x_imag = self.conv2(x_real, x_imag, edge_index)
-#         x_real = F.gelu(self.ln2_real(x_real))
-#         x_imag = F.gelu(self.ln2_imag(x_imag))
+#         mu_real, mu_imag = self.conv_mu(x_real, x_imag, edge_index_sym, edge_weight_complex)#norm, phase)
+#         logst_real, logst_imag = self.conv_logstd(x_real, x_imag, edge_index_sym, edge_weight_complex)#norm, phase)
         
-#         # MagNet protocol: Concat real and imag before final real mapping
-#         x_cat = torch.cat([x_real, x_imag], dim=-1)
+#         #return mu_real, mu_imag, logst_real, logst_imag
+
+#         # Concatenate into unified representations of size [B*N, 2 * out_channels]
+#         mu = torch.cat([mu_real, mu_imag], dim=-1)
+#         logstd = torch.cat([logst_real, logst_imag], dim=-1)
         
-#         return self.conv_mu(x_cat), self.conv_logstd(x_cat)
-
-# class MLP(torch.nn.Module):
-#     '''
-#     MLP auxiliary class
-#     '''
-#     def __init__(self, sizes, batch_norm=True, dropout=0.2):
-#         super(MLP, self).__init__()
-#         layers = []
-#         for s in range(len(sizes) - 1):
-#             layers = layers + [
-#                 torch.nn.Dropout(p=dropout),
-#                 torch.nn.Linear(sizes[s], sizes[s + 1]),
-#                 torch.nn.BatchNorm1d(sizes[s + 1])
-#                 if batch_norm and s < len(sizes) - 1 else None,
-#                 torch.nn.ReLU()
-#             ]
-
-#         layers = [l for l in layers if l is not None][:-1]
-#         self.network = torch.nn.Sequential(*layers)
-
-#     def forward(self, x):
-#         return self.network(x)
+#         return mu, logstd
 
 # class FeatureDecoder(torch.nn.Module):
-#     def __init__(self, n_channels, num_node_features, dropout_rate=0.1, q=0.25, K=2):
+#     def __init__(self, n_channels, num_node_features, dropout_rate=0.1):
 #         super().__init__()
-#         self.conv1 = MagNetConv(n_channels, n_channels, K=K, q=q)
+#         self.conv1 = MagNetConv(n_channels, n_channels, K=2)
 #         self.ln1_real = LayerNorm(n_channels)
 #         self.ln1_imag = LayerNorm(n_channels)
         
-#         self.conv2 = MagNetConv(n_channels, n_channels, K=K, q=q)
-#         self.ln2_real = LayerNorm(n_channels)
-#         self.ln2_imag = LayerNorm(n_channels)
+#         self.conv2 = MagNetConv(n_channels, 2*n_channels, K=2)
+#         self.ln2_real = LayerNorm(2*n_channels)
+#         self.ln2_imag = LayerNorm(2*n_channels)
+        
+#         self.conv3 = MagNetConv(2*n_channels, n_channels, K=2)
+#         self.ln3_real = LayerNorm(n_channels)
+#         self.ln3_imag = LayerNorm(n_channels)
         
 #         self.dropout_rate = dropout_rate
-#         # Final projection maps the concatenated 2*n_channels down to feature dimension
-#         self.last_layer = torch.nn.Linear(2*n_channels, num_node_features) 
-
-#     def forward(self, z, edge_index):
-#         # Latent z is strictly real because it was reparameterized from real mu and logstd
-#         z_real = F.dropout(z, p=self.dropout_rate, training=self.training)
-#         z_imag = torch.zeros_like(z_real)
         
-#         z_real, z_imag = self.conv1(z_real, z_imag, edge_index)
+#         # Last layer takes 2 * n_channels because we unwind (concatenate) real + imag
+#         self.last_layer = torch.nn.Linear(2 * n_channels, num_node_features) 
+
+#     def forward(self, z, edge_index_sym, edge_weight_complex):
+#         # Split the unified z back into real and imaginary halves for MagNetConv
+#         z_real, z_imag = z.chunk(2, dim=-1)
+
+#         z_real, z_imag = self.conv1(z_real, z_imag, edge_index_sym, edge_weight_complex)#norm, phase)
 #         z_real = F.gelu(self.ln1_real(z_real))
 #         z_imag = F.gelu(self.ln1_imag(z_imag))
 
 #         z_real = F.dropout(z_real, p=self.dropout_rate, training=self.training)
 #         z_imag = F.dropout(z_imag, p=self.dropout_rate, training=self.training)
         
-#         z_real, z_imag = self.conv2(z_real, z_imag, edge_index)
+#         z_real, z_imag = self.conv2(z_real, z_imag, edge_index_sym, edge_weight_complex)#norm, phase)
 #         z_real = F.gelu(self.ln2_real(z_real))
 #         z_imag = F.gelu(self.ln2_imag(z_imag))
+
+#         z_real = F.dropout(z_real, p=self.dropout_rate, training=self.training)
+#         z_imag = F.dropout(z_imag, p=self.dropout_rate, training=self.training)
         
-#         z_cat = torch.cat([z_real, z_imag], dim=-1)
+#         z_real, z_imag = self.conv3(z_real, z_imag, edge_index_sym, edge_weight_complex)#norm, phase)
+#         z_real = F.gelu(self.ln3_real(z_real))
+#         z_imag = F.gelu(self.ln3_imag(z_imag))
+
+#         # concat real and imaginary parts
+#         out = torch.cat([z_real, z_imag], dim=-1)
+#         out = self.last_layer(out)
         
-#         # Softplus prevents dying gradients (solving the flatline issue from earlier)
-#         return F.softplus(self.last_layer(z_cat))
+#         if self.training:
+#             return F.leaky_relu(out, negative_slope=0.05) 
+#         else:
+#             return F.relu(out)
+
+# class PerturbModel(torch.nn.Module):
+#     def __init__(self, edge_index, num_nodes, device, gene_weights=None, num_node_features=1, n_channels=32, q=0.25):
+#         super().__init__()
+#         self.device = device 
+#         self.num_nodes = num_nodes 
+#         self.n_channels = n_channels
+#         self.q = q # Directional tuning parameter for MagNet
+        
+#         self.register_buffer('edge_index', edge_index)
+
+#         # Weight Lookup Construction for WMSE
+#         default_weights = (1/num_nodes)*torch.ones(num_nodes)
+#         weight_lookup = default_weights.unsqueeze(0).repeat(num_nodes + 1, 1).to(device)    
+#         if isinstance(gene_weights, dict):
+#             for pert_idx, weight_array in gene_weights.items():
+#                 w_tensor = torch.tensor(weight_array, dtype=torch.float32, device=device)
+#                 if 0 <= pert_idx < num_nodes:
+#                     weight_lookup[pert_idx] = w_tensor
+#         self.register_buffer('weight_lookup', weight_lookup)
+
+#         self.encoder_in_channels = 1
+#         self.ko_mu = torch.nn.Embedding(num_nodes, 64)
+        
+#         # Double output size to cover both real and imaginary perturbations
+#         self.ko_mlp = MLP([64, n_channels, 2 * n_channels])
+
+#         self.encoder = VariationalGraphEncoder(self.encoder_in_channels, n_channels)
+#         self.gex_decoder = FeatureDecoder(n_channels, num_node_features)
+        
+#         self._cached_batch_size = 0
+#         self._cached_edge_index = None
+#         self._cached_gene_ids = None
+        
+#         # Cache for MagNet precomputations
+#         self._cached_magnet_attrs = None
+    
+#     def _get_batched_edge_index(self, batch_size):
+#         if batch_size == self._cached_batch_size and self._cached_edge_index is not None:
+#             return self._cached_edge_index
+#         offsets = torch.arange(batch_size, device=self.device) * self.num_nodes
+#         edge_index_batch = self.edge_index.unsqueeze(1) + offsets.view(1, -1, 1)
+#         edge_index_batch = edge_index_batch.reshape(2, -1)
+#         self._cached_batch_size = batch_size
+#         self._cached_edge_index = edge_index_batch
+#         return edge_index_batch
+
+#     def _get_batched_gene_ids(self, batch_size):
+#         if self._cached_gene_ids is not None and len(self._cached_gene_ids) == batch_size * self.num_nodes:
+#             return self._cached_gene_ids
+#         ids = torch.arange(self.num_nodes, device=self.device)
+#         ids = ids.repeat(batch_size) 
+#         self._cached_gene_ids = ids
+#         return ids
+
+#     # def reparametrize(self, mu_real, mu_imag, logstd_real, logstd_imag):
+#     #     if self.training:
+#     #         z_real = mu_real + torch.randn_like(logstd_real) * torch.exp(logstd_real)
+#     #         z_imag = mu_imag + torch.randn_like(logstd_imag) * torch.exp(logstd_imag)
+#     #         return z_real, z_imag
+#     #     else:
+#     #         return mu_real, mu_imag
+    
+#     def reparametrize(self, mu, logstd):
+#         if self.training:
+#             return mu + torch.randn_like(logstd) * torch.exp(logstd)
+#         else:
+#             return mu
+
+#     def kl_loss(self, mu, logstd, threshold=1e-2, verbose=True, free_bits=0.05):
+#         kl_raw = -0.5 * (1 + 2 * logstd - mu**2 - logstd.exp()**2)
+#         kl_per_dim = torch.mean(kl_raw, dim=0)
+#         return torch.mean(kl_per_dim)
+
+#     def forward(self, data, return_latent=True):
+#         x, pert = data
+#         x = x.to(self.device) #[B,N,1]
+#         pert = pert.to(self.device) #[B,N]
+
+#         batch_size, num_nodes, num_features = x.shape
+
+#         edge_index_batch = self._get_batched_edge_index(batch_size)
+#         x_real = x.reshape(batch_size * num_nodes, num_features) #[BxN,1]
+#         x_imag = torch.zeros_like(x_real) # Features start strictly real
+#         pert = pert.reshape(batch_size * num_nodes) #[BxN]
+
+#         # Fetch cached MagNet attributes or compute them if the batch size changed
+#         if self._cached_magnet_attrs is None or self._cached_batch_size != batch_size:
+#             self._cached_magnet_attrs = precompute_magnet_attributes_sparse(
+#                 edge_index_batch, batch_size * num_nodes, self.q
+#             )
+#         edge_index_sym, edge_weight_complex = self._cached_magnet_attrs
+
+#         # # Encoder pass
+#         # mu_real, mu_imag, logstd_real, logstd_imag = self.encoder(x_real, x_imag, edge_index_sym, edge_weight_complex)#norm, phase) 
+        
+#         # logstd_real = torch.clamp(logstd_real, min=-20, max=10) 
+#         # logstd_imag = torch.clamp(logstd_imag, min=-20, max=10)
+
+#         # # Concatenate for loss functions outside
+#         # self.last_mu = torch.cat([mu_real, mu_imag], dim=-1)
+#         # self.last_logstd = torch.cat([logstd_real, logstd_imag], dim=-1)
+
+#         # z_ctrl_real, z_ctrl_imag = self.reparametrize(mu_real, mu_imag, logstd_real, logstd_imag)     
+#         # self.last_z = torch.cat([z_ctrl_real, z_ctrl_imag], dim=-1)
+        
+#         # # Control decoder pass
+#         # x_hat = self.gex_decoder(z_ctrl_real, z_ctrl_imag, edge_index_sym, edge_weight_complex)#norm, phase)
+
+#         #encoder pass
+#         mu, logstd = self.encoder(x_real, x_imag, edge_index_sym, edge_weight_complex) 
+#         logstd = torch.clamp(logstd, min=-20, max=10)
+
+#         self.last_mu = mu
+#         self.last_logstd = logstd
+
+#         z_ctrl = self.reparametrize(mu, logstd)     
+#         self.last_z = z_ctrl
+#         x_hat = self.gex_decoder(z_ctrl, edge_index_sym, edge_weight_complex)
+        
+#         # Perturbation logic
+#         pert_mask = pert.bool()
+#         # delta_mu_real = torch.zeros_like(mu_real)
+#         # delta_mu_imag = torch.zeros_like(mu_imag)
+#         delta_mu = torch.zeros_like(mu)
+
+#         if pert_mask.any():
+#             gene_ids = self._get_batched_gene_ids(batch_size)
+#             perturbed_gene_ids = gene_ids[pert_mask]
+#             ko_embeddings = self.ko_mu(perturbed_gene_ids)
+#             # mu_shift = self.ko_mlp(ko_embeddings)
+            
+#             # # Split shift into real and imaginary updates
+#             # mu_shift_real, mu_shift_imag = mu_shift.chunk(2, dim=-1)
+#             # delta_mu_real[pert_mask] = mu_shift_real
+#             # delta_mu_imag[pert_mask] = mu_shift_imag
+#             delta_mu[pert_mask] = self.ko_mlp(ko_embeddings)
+            
+#         # mu_pert_real = mu_real + delta_mu_real
+#         # mu_pert_imag = mu_imag + delta_mu_imag
+        
+#         # z_pert_real, z_pert_imag = self.reparametrize(mu_pert_real, mu_pert_imag, logstd_real, logstd_imag)
+        
+#         # # Perturbed decoder pass
+#         # y_hat = self.gex_decoder(z_pert_real, z_pert_imag, edge_index_sym, edge_weight_complex)
+#         mu_pert = mu + delta_mu
+#         z_pert = self.reparametrize(mu_pert, logstd)
+        
+#         y_hat = self.gex_decoder(z_pert, edge_index_sym, edge_weight_complex)
+        
+#         return y_hat, x_hat
+    
+#     def predict_full_expression(self, data):
+#         self.eval()
+#         return self.forward(data)[0]
 
 class VariationalGraphEncoder(torch.nn.Module):
     ''' encoder class
@@ -168,9 +344,9 @@ class FeatureDecoder(torch.nn.Module):
         super().__init__()
         self.conv1 = DirGNNConv(ChebConv(n_channels, n_channels, 2))
         self.ln1 = LayerNorm(n_channels)
-        self.conv2 = DirGNNConv(ChebConv(n_channels, 2*n_channels, 2))
-        self.ln2 = LayerNorm(2*n_channels)
-        self.conv3 = DirGNNConv(ChebConv(2*n_channels, n_channels, 2))
+        self.conv2 = DirGNNConv(ChebConv(n_channels, n_channels, 2))
+        self.ln2 = LayerNorm(n_channels)
+        self.conv3 = DirGNNConv(ChebConv(n_channels, n_channels, 2))
         self.ln3 = LayerNorm(n_channels)
         self.dropout_rate = dropout_rate
         self.last_layer = torch.nn.Linear(n_channels, num_node_features) 
@@ -179,21 +355,46 @@ class FeatureDecoder(torch.nn.Module):
 
     def forward(self, z, edge_index):
         #z = F.dropout(z, p=self.dropout_rate, training=self.training)
-        z = self.conv1(z, edge_index)
-        z = self.ln1(z)
-        z = F.gelu(z)
+        # z = self.conv1(z, edge_index)
+        # z = self.ln1(z)
+        # z = F.gelu(z)
 
-        z = F.dropout(z, p=self.dropout_rate, training=self.training)
-        z = self.conv2(z, edge_index)
-        z = self.ln2(z)
-        z = F.gelu(z)
+        # z = F.dropout(z, p=self.dropout_rate, training=self.training)
+        # z = self.conv2(z, edge_index)
+        # z = self.ln2(z)
+        # z = F.gelu(z)
 
-        z = F.dropout(z, p=self.dropout_rate, training=self.training)
-        z = self.conv3(z, edge_index)
-        z = self.ln3(z)
-        z = F.gelu(z)
+        # z = F.dropout(z, p=self.dropout_rate, training=self.training)
+        # z = self.conv3(z, edge_index)
+        # z = self.ln3(z)
+        # z = F.gelu(z)
 
-        out = self.last_layer(z)
+        # out = self.last_layer(z)
+        # if self.training:
+        #     return F.leaky_relu(out, negative_slope=0.05) 
+        # else:
+        # return F.relu(out)
+
+        h1 = self.conv1(z, edge_index)
+        h1 = self.ln1(h1)
+        h1_out = F.gelu(h1) + z  # Intra-layer skip 1
+
+        h1_drop = F.dropout(h1_out, p=self.dropout_rate, training=self.training)
+        h2 = self.conv2(h1_drop, edge_index)
+        h2 = self.ln2(h2)
+        h2_out = F.gelu(h2) + h1_out # Intra-layer skip 2
+
+        h2_drop = F.dropout(h2_out, p=self.dropout_rate, training=self.training)
+        h3 = self.conv3(h2_drop, edge_index)
+        h3 = self.ln3(h3)
+        h3_out = F.gelu(h3) + h2_out # Intra-layer skip 3
+
+        # h3_out = h3_out + z
+
+        # Output Head
+        out = self.last_layer(h3_out) 
+        
+        # LeakyReLU during training to prevent dead gradients, hard ReLU for biological realism at eval
         if self.training:
             return F.leaky_relu(out, negative_slope=0.05) 
         else:

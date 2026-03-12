@@ -296,8 +296,8 @@ def compute_weights(adata, gene_to_idx, cells_per_pert=256, score_type = 'scores
     adata_n_cells = []
     unique_perts = adata.obs['target_gene'].unique()
     for pert in unique_perts:
-        if pert == 'non-targeting': 
-            continue # Skip control for the training weight calculation (usually)
+        # if pert == 'non-targeting': 
+        #     continue # Skip control for the training weight calculation (usually)
 
         # cell indices    
         pert_idx = adata.obs_names[adata.obs['target_gene'] == pert]
@@ -314,7 +314,7 @@ def compute_weights(adata, gene_to_idx, cells_per_pert=256, score_type = 'scores
     adata_n_cells = sc.concat(adata_n_cells) # balanced dataset (NOTE: does not contain control)  
 
     # Get DEGs vs rest
-    curr_deg_results = compute_degs(adata_n_cells, mode='vsrest')
+    curr_deg_results = compute_degs(adata_n_cells, mode='vscontrol') #vsrest
     names_df_vsrest = pd.DataFrame(curr_deg_results["names"])
     scores_df_vsrest = pd.DataFrame(curr_deg_results[score_type])
         
