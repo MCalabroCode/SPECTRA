@@ -290,12 +290,12 @@ class VariationalGraphEncoder(torch.nn.Module):
     def __init__(self, in_channels, out_channels, dropout_rate = 0.2):
         super().__init__()
         self.out_channels = out_channels
-        self.conv1 = DirGNNConv(ChebConv(in_channels, out_channels, 3)) 
+        self.conv1 = DirGNNConv(ChebConv(in_channels, out_channels, 2)) 
         self.ln1 = LayerNorm(out_channels)
-        self.conv2 = DirGNNConv(ChebConv(out_channels, 2*out_channels, 3))
+        self.conv2 = DirGNNConv(ChebConv(out_channels, 2*out_channels, 2))
         self.ln2 = LayerNorm(2*out_channels)
-        self.conv_mu = DirGNNConv(ChebConv(2*out_channels, out_channels, 2))  
-        self.conv_logstd = DirGNNConv(ChebConv(2*out_channels, out_channels, 2))
+        self.conv_mu = DirGNNConv(ChebConv(2*out_channels, out_channels, 1))  
+        self.conv_logstd = DirGNNConv(ChebConv(2*out_channels, out_channels, 1))
         self.dropout_rate = dropout_rate
 
     def forward(self, x, edge_index):
@@ -346,8 +346,6 @@ class FeatureDecoder(torch.nn.Module):
         self.ln1 = LayerNorm(n_channels)
         self.conv2 = DirGNNConv(ChebConv(n_channels, n_channels, 2))
         self.ln2 = LayerNorm(n_channels)
-        self.conv3 = DirGNNConv(ChebConv(n_channels, n_channels, 2))
-        self.ln3 = LayerNorm(n_channels)
         self.dropout_rate = dropout_rate
         self.last_layer = torch.nn.Linear(n_channels, num_node_features) 
 
@@ -384,15 +382,15 @@ class FeatureDecoder(torch.nn.Module):
         h2 = self.ln2(h2)
         h2_out = F.gelu(h2) + h1_out # Intra-layer skip 2
 
-        h2_drop = F.dropout(h2_out, p=self.dropout_rate, training=self.training)
-        h3 = self.conv3(h2_drop, edge_index)
-        h3 = self.ln3(h3)
-        h3_out = F.gelu(h3) + h2_out # Intra-layer skip 3
+        # h2_drop = F.dropout(h2_out, p=self.dropout_rate, training=self.training)
+        # h3 = self.conv3(h2_drop, edge_index)
+        # h3 = self.ln3(h3)
+        # h3_out = F.gelu(h3) + h2_out # Intra-layer skip 3
 
         # h3_out = h3_out + z
 
         # Output Head
-        out = self.last_layer(h3_out) 
+        out = self.last_layer(h2_out) 
         
         # LeakyReLU during training to prevent dead gradients, hard ReLU for biological realism at eval
         if self.training:
@@ -876,12 +874,12 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
         print(f'training KL = {epoch_kl:.5f} | mse = {epoch_mse:.3f} | cos = {epoch_cos:.3f}')
 
         # save current epoch weights
-        filepath = os.path.join(weights_dir, f"temp_weights_epoch_{epoch}.pth")
+        filepath = os.path.join(weights_dir, f"echoes_weights_epoch_{epoch}.pth")
         torch.save(model.state_dict(), filepath)
         
         # validation
         if epoch!=0:
-            _, avg_feat_err = test_perturb_model(model, test_loader, model.device)
+            _, avg_feat_err = 0,0#test_perturb_model(model, test_loader, model.device)
             test_wmse.append(avg_feat_err)
 
             # routine for plotting traning/testing metrics during the training
@@ -925,9 +923,9 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
                 "train/cosine_loss": epoch_cos,
             }
 
-            # Only log validation metric if it was calculated
-            if avg_feat_err is not None:
-                log_metrics["val/test_wmse"] = avg_feat_err
+            # # Only log validation metric if it was calculated
+            # if avg_feat_err is not None:
+            #     log_metrics["val/test_wmse"] = avg_feat_err
                 
             wandb.log(log_metrics)
 

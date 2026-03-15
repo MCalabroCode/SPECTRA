@@ -314,7 +314,7 @@ def compute_weights(adata, gene_to_idx, cells_per_pert=256, score_type = 'scores
     adata_n_cells = sc.concat(adata_n_cells) # balanced dataset (NOTE: does not contain control)  
 
     # Get DEGs vs rest
-    curr_deg_results = compute_degs(adata_n_cells, mode='vscontrol') #vsrest
+    curr_deg_results = compute_degs(adata_n_cells, mode='vsrest') #vscontrol
     names_df_vsrest = pd.DataFrame(curr_deg_results["names"])
     scores_df_vsrest = pd.DataFrame(curr_deg_results[score_type])
         
