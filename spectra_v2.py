@@ -443,6 +443,9 @@ class PerturbModel(torch.nn.Module):
         self._cached_batch_size = 0
         self._cached_edge_index = None
         self._cached_gene_ids = None
+
+        num_trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f'number of trainable parameters: {num_trainable_params}')
     
     def _get_batched_edge_index(self, batch_size):
         '''

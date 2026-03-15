@@ -1,6 +1,5 @@
 
 # functions to configure the model and the data
-# TODO: must be adapted for SPECTRA
 
 import os
 import json
@@ -9,15 +8,14 @@ import networkx as nx
 import anndata as ad
 from tqdm import tqdm
 import numpy as np
-
-
+from tqdm import tqdm
+from scipy import sparse
+import anndata as ad
+import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-# import torch_geometric.transforms as T
-# from torch_geometric.loader import DataLoader
-# from torch_geometric.utils import from_networkx
-# from torch_geometric.data import Data
+
 
 from torch.utils.data.sampler import Sampler
 import random
@@ -50,35 +48,10 @@ def load_model_config(config_file_path: str):
 
     return args
 
-#TODO: must be adapted for SPECTRA
-def load_graph(network_path: str):
-    ''' import networkx graph from json
-
-    Args:
-        network_path (str): path to the network json file (edge lists)
-    Retruns:
-        networkx DiGraph: the loaded graph
-    '''
-
-    #with open('../network_hvg.json', 'r') as json_file:
-        # First, check if the configuration file exists.
-    if not os.path.exists(network_path):
-        raise ValueError(f"Error: The network file '{network_path}' was not found.")
-    with open(network_path, 'r') as json_file:
-        network = json.load(json_file)
-        
-    # Create the networkx graph
-    G = nx.DiGraph()
-    for tf, targets in network.items():
-        for target, weight in targets:
-            G.add_edge(tf, target, weight=weight)
-    
-    return G 
-
-
-
-# a special batch sampler that groups only cells from the same interventional distribution into a batch
 class SCDATA_sampler(Sampler):
+    '''
+    a special batch sampler that groups only cells from the same interventional distribution into a batch
+    '''
     def __init__(self, data, batchsize, ptb_name=None):
         self.intervindices = []
         self.len = 0
@@ -174,7 +147,7 @@ def build_model_dataloaders(adata, edge_index, config):
     #TODO: add sanity check for dataset_size (must be inferior than the number of the perturbed cells, see how the sampling works)
 
     # Setup
-    dataset_size = (adata.obs['target_gene'] != 'non-targeting').sum() #config['dataset_size']
+    dataset_size = config['dataset_size'] #(adata.obs['target_gene'] != 'non-targeting').sum() 
     test_ratio = config['test_ratio']
     val_ratio = config['val_ratio']
     test_size = int(dataset_size * test_ratio)
@@ -217,4 +190,173 @@ def build_model_dataloaders(adata, edge_index, config):
     return train_loader, val_loader, test_loader
 
 
+####### data generation #######
 
+
+def baseline(train_adata, pert):
+    '''
+    The model should return just one sample. 
+    Here, we set up the possibility of return a certain number of samples for each pert, to emulate
+    the generation of the predictions in the a<ctual model
+    '''
+
+    # pesuedobulk creation
+    df = pd.DataFrame(
+        pred_adata.X.toarray() if hasattr(pred_adata.X, "toarray") else pred_adata.X,
+        index=pred_adata.obs["target_gene"],
+        columns=pred_adata.var_names
+    )
+
+    means = df.groupby(level=0, sort=False).mean()
+    means = means.loc[means.index!='non-targeting']
+    if pert in means.index:
+        return means.loc[pert,:] #pandas series
+    else:
+        return means.mean(axis=0) #if pert is not part of traioning perturbs , return the average on all perturbations
+
+
+def generate_adata_from_control(gene_counts_dict, real_adata, model, gene_to_idx, var_names, batch_size=32):
+
+    prediction_list = []
+    obs_gene_list = []
+
+    # ctrl
+    real_adata_control = real_adata[real_adata.obs['target_gene'] == 'non-targeting']
+    ctrl_data = real_adata_control.X.toarray() if hasattr(real_adata_control.X, "toarray") else np.asarray(real_adata_control.X)
+    ctrl_data = torch.tensor(ctrl_data, dtype=torch.float)
+
+    model.eval()
+    with torch.no_grad():
+        for pert, n_samples in tqdm(gene_counts_dict.items()):
+
+            # Perturbation one-hot embedding
+            pert_embedding = torch.zeros(real_adata.shape[1], dtype=torch.bool)
+            if pert != 'non-targeting':
+                perturbs = [gene_to_idx[g] for g in pert.split('+') if g in gene_to_idx]
+                for single_pert in perturbs:
+                    pert_embedding[single_pert] = True
+            pert_embedding = pert_embedding.unsqueeze(0)
+            
+            # Mini-batch generation to prevent CUDA OOM
+            for offset in range(0, n_samples, batch_size):
+
+                # Calculate how many cells to generate in this specific chunk
+                chunk_size = min(batch_size, n_samples - offset)
+                pert_batch = pert_embedding.expand(chunk_size, -1).to(model.device)
+                
+                # Sample control cells for this chunk
+                random_indices = np.random.choice(ctrl_data.shape[0], size=chunk_size, replace=True)
+                ctrl_batch = ctrl_data[random_indices, :] # shape [B,N]
+                ctrl_batch = ctrl_batch.unsqueeze(-1).to(model.device) # shape [B,N,1]
+                
+                # Predict
+                data = ctrl_batch, pert_batch
+                predicted_full_gex = model.predict_full_expression(data)
+                
+
+                predicted_full_gex = predicted_full_gex.reshape(chunk_size, -1).detach().cpu().numpy()
+                prediction_list.append(predicted_full_gex) 
+                obs_gene_list.extend([pert] * chunk_size)
+
+    # Compile the final AnnData
+    X = np.vstack(prediction_list)
+    obs = pd.DataFrame({"target_gene": obs_gene_list})
+    var = pd.DataFrame(index=var_names)
+    pred_adata = ad.AnnData(X=X, obs=obs, var=var)
+    
+    return pred_adata
+
+def generate_adata_from_control_old(gene_counts_dict, real_adata, model, gene_to_idx, var_names):
+    '''
+    this code is not optimized. Do not use.
+    '''
+
+    prediction_list = []
+    obs_gene_list = []
+
+    # ctrl
+    real_adata_control = real_adata[real_adata.obs['target_gene']=='non-targeting']
+    ctrl_data = real_adata_control.X.toarray() if hasattr(real_adata_control.X, "toarray") else np.asarray(real_adata_control.X)
+    ctrl_data = torch.tensor(ctrl_data, dtype=torch.float)
+
+    for pert, n_samples in tqdm(gene_counts_dict.items()):
+
+        # perturbation one-hot embedding
+        pert_embedding = torch.zeros(len(var_names), dtype=torch.bool)
+        if pert!='non-targeting':
+            perturbs = [gene_to_idx[g] for g in pert.split('+') if g in gene_to_idx] #NOTE: this takes into account multi-genes pertrurbations
+            for single_pert in perturbs:
+                pert_embedding[single_pert]=True
+            pert_embedding = pert_embedding.unsqueeze(0)
+            
+        for i in range(n_samples):
+            ctrl_sample = ctrl_data[np.random.randint(0, ctrl_data.shape[0], 1), :].reshape(-1,1).unsqueeze(0)
+            data = ctrl_sample, pert_embedding
+            predicted_full_gex= model.predict_full_expression(data)
+            predicted_full_gex = predicted_full_gex.reshape(1,-1).detach().cpu()
+            prediction_list.append(predicted_full_gex.numpy()) 
+            obs_gene_list.append(pert)
+
+    X = np.vstack(prediction_list)
+    obs = pd.DataFrame({"target_gene": obs_gene_list})
+    var = pd.DataFrame(index=var_names)
+    pred_adata = ad.AnnData(X=X, obs=obs, var=var)
+    
+    return pred_adata
+
+####### with TSNE
+from sklearn.manifold import TSNE
+
+def _generate_adata_from_control_old(gene_counts_dict, real_adata, model, gene_to_idx, var_names):
+    '''
+    this code is not optimized. Do not use.
+    contains TSNE projection
+    '''
+    prediction_list = []
+    obs_gene_list = []
+    latent_representations = []
+
+    real_adata_control = real_adata[real_adata.obs['target_gene']=='non-targeting']
+    ctrl_data = real_adata_control.X.toarray() if hasattr(real_adata_control.X, "toarray") else np.asarray(real_adata_control.X)
+    ctrl_data = torch.tensor(ctrl_data, dtype=torch.float)
+
+    for pert, n_samples in tqdm(gene_counts_dict.items()):
+
+        # perturbation one-hot embedding
+        pert_embedding = torch.zeros(len(var_names), dtype=torch.bool)
+        if pert!='non-targeting':
+            perturbs = [gene_to_idx[g] for g in pert.split('+') if g in gene_to_idx] #NOTE: this takes into account multi-genes pertrurbations
+            for single_pert in perturbs:
+                pert_embedding[single_pert]=True
+            pert_embedding = pert_embedding.unsqueeze(0)
+            
+        # sampling random control cell
+        for i in range(n_samples):
+            ctrl_sample = ctrl_data[np.random.randint(0, ctrl_data.shape[0], 1), :].reshape(-1,1).unsqueeze(0)
+            data = ctrl_sample, pert_embedding
+            predicted_full_gex, z_mean = model.predict_full_expression(data)
+            predicted_full_gex = predicted_full_gex.reshape(1,-1).detach().cpu()
+            z_mean = z_mean.reshape(1,-1)
+            latent_representations.append(z_mean)
+            prediction_list.append(predicted_full_gex.numpy()) 
+            obs_gene_list.append(pert)
+
+        
+    X = np.vstack(prediction_list)
+    obs = pd.DataFrame({"target_gene": obs_gene_list})
+    var = pd.DataFrame(index=var_names)
+    pred_adata = ad.AnnData(X=X, obs=obs, var=var)
+
+    # print('calculating embeddings for the latent space...')
+    # latent_complete = np.vstack(latent_representations)
+    # embedding_2d = TSNE(n_components=2, init='pca').fit_transform(latent_complete)
+    # pred_adata.obsm['X_tsne'] = embedding_2d
+    # print('tsne embedding: done')
+    
+    print('calculating UMAP for the latent space...')
+    latent_complete = np.vstack(latent_representations)
+    pred_adata.obsm['X_latent'] = latent_complete
+    sc.pp.neighbors(pred_adata, use_rep='X_latent', n_neighbors=15, metric='euclidean')
+    sc.tl.umap(pred_adata)
+
+    return pred_adata
