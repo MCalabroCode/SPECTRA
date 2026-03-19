@@ -415,7 +415,7 @@ class PerturbModel(torch.nn.Module):
         # Weight Lookup Construction for WMSE
         default_weights = (1/num_nodes)*torch.ones(num_nodes)
         weight_lookup = default_weights.unsqueeze(0).repeat(num_nodes + 1, 1).to(device)    
-        if isinstance(gene_weights, dict):
+        if gene_weights is not None:
             for pert_idx, weight_array in gene_weights.items():
                 w_tensor = torch.tensor(weight_array, dtype=torch.float32, device=device)
                 if 0 <= pert_idx < num_nodes:

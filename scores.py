@@ -16,6 +16,7 @@ def MAE_error(real_adata, pred_adata):
         if not isinstance(selected_pred, np.ndarray):
             selected_pred = selected_pred.toarray()
 
+        # pseudobulk
         mean_real = np.mean(selected_real, axis=0)
         mean_pred = np.mean(selected_pred, axis=0)
 
@@ -41,12 +42,19 @@ def corr_error(real_adata, pred_adata, correlation='pearson'):
         if not isinstance(selected_pred, np.ndarray):
             selected_pred = selected_pred.toarray()
         
-        if correlation=='spearman':
-            corrs = [stats.spearmanr(selected_real[:, i], selected_pred[:, i])[0] for i in range(selected_pred.shape[1])]
+        # CORRECTION: pseudobulk - otherise we would assume aligment of cells - absurd
+        real_mean = selected_real.mean(axis=0)
+        pred_mean = selected_pred.mean(axis=0)
+        if correlation == "spearman":
+            r = stats.spearmanr(real_mean, pred_mean)[0]
         else:
-            corrs = [stats.pearsonr(selected_real[:, i], selected_pred[:, i])[0] for i in range(selected_pred.shape[1])]
-
-        corr[pert] = np.nanmean(corrs)
+            r = stats.pearsonr(real_mean, pred_mean)[0]
+        # if correlation=='spearman':
+        #     corrs = [stats.spearmanr(selected_real[:, i], selected_pred[:, i])[0] for i in range(selected_pred.shape[1])]
+        # else:
+        #     corrs = [stats.pearsonr(selected_real[:, i], selected_pred[:, i])[0] for i in range(selected_pred.shape[1])]
+        
+        corr[pert] = r#np.nanmean(corrs)
 
     print(corr)
     print('=====')

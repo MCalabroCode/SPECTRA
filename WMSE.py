@@ -236,9 +236,10 @@ def compute_degs(adata, mode='vsrest', pval_threshold=0.05):
         raise ValueError("mode must be 'vsrest' or 'vscontrol'")
     
     # Compute DEGs
-    sc.tl.rank_genes_groups(adata_subset, 
+    sc.tl.rank_genes_groups(
+        adata_subset, 
         'target_gene', 
-        method='t-test_overestim_var', 
+        method='wilcoxon', # t-test_overestim_var
         reference=reference, 
         use_raw=False   
     )
@@ -353,3 +354,4 @@ def compute_weights(adata, gene_to_idx, cells_per_pert=256, score_type = 'scores
         final_weight_dict[gene_to_idx[pert]] = weights.values # TODO: adapt for multiple perturbations!! (I think it is enough to just build the dictionary with perturbations as keys, and not the genes!)
 
     return final_weight_dict
+

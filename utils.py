@@ -82,7 +82,7 @@ class SCDATA_sampler(Sampler):
 
 def chunk(indices, chunk_size):
     split = torch.split(torch.tensor(indices), chunk_size) # this divides the torch indices into subsets of equal length chunk_size
-    
+    #NOTE: split will be a tuple of tensors
     if len(indices) % chunk_size == 0:
         return split
     elif len(split) > 0:
@@ -96,13 +96,12 @@ def chunk(indices, chunk_size):
 
 
 class PerturbationDataset(Dataset):
-    def __init__(self, adata, gene_to_idx, edge_index, start_idx=0, end_idx=None, seed=42):
+    def __init__(self, adata, gene_to_idx, edge_index, start_idx=0, end_idx=None):
         super().__init__()
 
         self.edge_index = edge_index.share_memory_()
         self.gene_to_idx = gene_to_idx
         self.start_idx = start_idx
-        self.seed = seed
         self.end_idx = end_idx if end_idx is not None else len(adata)
 
         adata = adata[self.start_idx:self.end_idx].copy()
@@ -127,15 +126,12 @@ class PerturbationDataset(Dataset):
         return embedding
 
     def __getitem__(self, idx):
-        
-        # Map to actual index in adata
-        actual_idx = idx
 
-        #x = self.rand_ctrl_samples[actual_idx].view(-1,1)
+        #x = self.rand_ctrl_samples[idx].view(-1,1)
         j = np.random.randint(0, self.ctrl_samples.shape[0]) #random control cell
         x = self.ctrl_samples[j].view(-1,1)
-        y = self.ptb_samples[actual_idx].view(-1,1)
-        pert = self._pert_embedding(self.ptb_names[actual_idx])
+        y = self.ptb_samples[idx].view(-1,1)
+        pert = self._pert_embedding(self.ptb_names[idx])
 
         return x,y,pert
 
@@ -195,11 +191,8 @@ def build_model_dataloaders(adata, edge_index, config):
 
 def baseline_model(train_adata, pert):
     '''
-    The model should return just one sample. 
-    Here, we set up the possibility of return a certain number of samples for each pert, to emulate
-    the generation of the predictions in the a<ctual model
+    do not use, not efficient. here just for reference
     '''
-
     # pesuedobulk creation
     df = pd.DataFrame(
         train_adata.X.toarray() if hasattr(train_adata.X, "toarray") else train_adata.X,
@@ -223,7 +216,7 @@ def generate_adata_baseline(gene_counts_dict, train_adata, var_names):
     prediction_list = []
     obs_gene_list = []
 
-    # precompute means
+    # precompute pseudobulk and means
     df = pd.DataFrame(
         train_adata.X.toarray() if hasattr(train_adata.X, "toarray") else np.asarray(train_adata.X),
         index=train_adata.obs["target_gene"],
@@ -245,7 +238,7 @@ def generate_adata_baseline(gene_counts_dict, train_adata, var_names):
         else:
             pert_pred = global_mean
             
-        # Duplicate the 1D prediction array into a 2D array of shape [n_samples, n_genes]
+        # repeat the 1D prediction array into a 2D array of shape [n_samples, n_genes]
         repeated_preds = np.tile(pert_pred, (n_samples, 1))
         
         prediction_list.append(repeated_preds)
@@ -258,6 +251,27 @@ def generate_adata_baseline(gene_counts_dict, train_adata, var_names):
     pred_adata = ad.AnnData(X=X, obs=obs, var=var)
     
     return pred_adata
+
+
+def technical_duplicate_baseline(adata):
+    '''
+    We compute this baseline by randomly dividing the population of cells 
+    receiving a perturbation in half and using one half of the cells to
+    predict the other half. Works only for pertubrations already seen.
+    '''
+    indices_1 = []
+    indices_2 = []
+    for gene, idx in adata.obs.groupby("target_gene").indices.items():
+        idx = np.array(idx) # list of indices associated to gene (the target_gene)
+        np.random.shuffle(idx)  # Randomize indices
+        half = len(idx) // 2
+        #indices_1.extend(idx[:half])
+        indices_2.extend(idx[half:])
+    #real_adata = adata[indices_1].copy()
+    pred_adata = adata[indices_2].copy()
+    return pred_adata
+
+
 
 def generate_adata_from_control(gene_counts_dict, real_adata, model, gene_to_idx, var_names, batch_size=32):
 
@@ -405,20 +419,4 @@ def _generate_adata_from_control_old(gene_counts_dict, real_adata, model, gene_t
 
     return pred_adata
 
-def technical_duplicate_baseline(adata):
-    '''
-    We compute this baseline by randomly dividing the population of cells 
-    receiving a perturbation in half and using one half of the cells to
-    predict the other half. Works only for pertubrations already seen.
-    '''
-    indices_1 = []
-    indices_2 = []
-    for gene, idx in adata.obs.groupby("target_gene").indices.items():
-        idx = np.array(idx) # list of indices associated to gene (the target_gene)
-        np.random.shuffle(idx)  # Randomize indices
-        half = len(idx) // 2
-        #indices_1.extend(idx[:half])
-        indices_2.extend(idx[half:])
-    #real_adata = adata[indices_1].copy()
-    pred_adata = adata[indices_2].copy()
-    return pred_adata
+
