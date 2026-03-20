@@ -71,14 +71,15 @@ import scanpy as sc
 import numpy as np
 import pandas as pd
 from scipy.stats import rankdata
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, average_precision_score
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 class RobustDES:
     def __init__(self, 
                  lfc_threshold=0.5, 
-                 alpha=0.05):
+                 alpha=0.05,
+                 min_cell_fraction=0.1):
         """
         lfc_threshold: Minimum abs(Log2 Fold Change) to consider a gene DE.
         alpha: Adjusted p-value threshold (FDR).
@@ -86,6 +87,7 @@ class RobustDES:
         """
         self.lfc_threshold = lfc_threshold
         self.alpha = alpha
+        self.min_cell_fraction = min_cell_fraction
 
     def get_de_genes(self, adata, perturbation_key, perturb_label, control_label):
         """
@@ -105,25 +107,25 @@ class RobustDES:
         )
         # Extract results
         result_df = sc.get.rank_genes_groups_df(subset, group=perturb_label) # columns: [scores, logfoldchanges, pvals, pvals_adj], shape [num_genes, 4]
-        # Apply "Sparsity Filter" (Heuristic for pseudobulk robustness)
+        
         # Calculate fraction of cells expressing the gene in the perturbation group
-        # perturb_cells = subset[subset.obs[perturbation_key] == perturb_label]
-        # X = perturb_cells.X
-        # if hasattr(X, "toarray") or hasattr(X, "tocsr"):
-        #     detected_vals = np.array((X > 0).mean(axis=0)).flatten()
-        # else:
-        #     detected_vals = np.array((X > 0).mean(axis=0)).flatten()
+        perturb_cells = subset[subset.obs[perturbation_key] == perturb_label]
+        X = perturb_cells.X
+        if hasattr(X, "toarray") or hasattr(X, "tocsr"):
+            detected_vals = np.array((X > 0).mean(axis=0)).flatten()
+        else:
+            detected_vals = np.array((X > 0).mean(axis=0)).flatten()
         
         # rank_genes_groups_df uses gene names as values, not index
-        #gene_map = dict(zip(subset.var_names, detected_vals))
-        #result_df['pct_cells'] = result_df['names'].map(gene_map)
+        gene_map = dict(zip(subset.var_names, detected_vals))
+        result_df['pct_cells'] = result_df['names'].map(gene_map)
 
         mask_sig = (result_df['pvals_adj'] < self.alpha)
         mask_lfc = (result_df['logfoldchanges'].abs() > self.lfc_threshold)
-        #mask_sparsity = (result_df['pct_cells'] > self.min_cell_fraction)
+        mask_sparsity = (result_df['pct_cells'] > self.min_cell_fraction)
         
         # The robust set of DE genes
-        de_genes_df = result_df[mask_sig & mask_lfc].copy()
+        de_genes_df = result_df[mask_sig & mask_lfc & mask_sparsity].copy()
         
         return de_genes_df[['names', 'logfoldchanges']].set_index('names'), result_df
 
@@ -243,3 +245,135 @@ class RobustDES:
         #plt.savefig('cm.pdf', dpi=300, bbox_inches='tight')
         plt.show()
         return mean_cm
+
+    def calculate_AUPRC_score(self, adata_true, adata_pred, perturbation_key, perturb_label, control_label):
+        """
+        AUPRC paper
+        """
+        # identify True DE Genes (G_true)
+        df_true, result_df_true = self.get_de_genes(adata_true, perturbation_key, perturb_label, control_label)
+        G_true = set(df_true.index)
+        n_true = len(G_true)
+
+        if n_true == 0:
+            return 0.0 # Avoid division by zero, or handle as specific case
+
+        # identify Predicted DE Genes (G_pred)
+        df_pred, result_df_pred = self.get_de_genes(adata_pred, perturbation_key, perturb_label, control_label)
+        G_pred = set(df_pred.index)
+        n_pred = len(G_pred)
+        print(f'pert {perturb_label} - n_true = {n_true}, n_pred = {n_pred}')
+        print(perturb_label in G_pred)
+
+        # true positives
+        TP = G_pred.intersection(G_true)
+        score = len(TP)/(n_pred+1e-8)
+
+        return score
+
+import numpy as np
+import pandas as pd
+import scipy.stats as stats
+from sklearn.metrics import precision_recall_curve, auc, average_precision_score
+from statsmodels.stats.multitest import multipletests
+
+def calculate_auprc_score(adata_true, adata_pred, pert_col='target_gene', control_name='non-targeting', fdr_thresh=0.01, logfc_thresh=0.3):
+    """
+    Calculates AUPRC for predicted scRNA-seq perturbation responses.
+    Assumes adata.X contains log-normalized counts (e.g., log1p).
+    """
+    common_genes = adata_true.var_names.intersection(adata_pred.var_names)
+    adata_true = adata_true[:, common_genes].copy()
+    adata_pred = adata_pred[:, common_genes].copy()
+
+    # isolate the in vitro control cells (used for both GT and Pred comparisons)
+    control_mask = adata_true.obs[pert_col] == control_name
+    X_control_true = adata_true[control_mask].X.toarray() if hasattr(adata_true.X, 'toarray') else adata_true.X
+    #mean_control_true = np.mean(X_control_true, axis=0)
+    mean_control_true = np.mean(np.expm1(X_control_true), axis=0)    
+
+    perturbations = [p for p in adata_true.obs[pert_col].unique() if p != control_name]
+    
+    results = []
+    
+    for pert in tqdm(perturbations):
+
+        # GT DEGs (In Vitro vs In Vitro)
+        mask_pert_true = adata_true.obs[pert_col] == pert
+        X_pert_true = adata_true[mask_pert_true].X.toarray() if hasattr(adata_true.X, 'toarray') else adata_true[mask_pert_true].X
+        #mean_pert_true = np.mean(X_pert_true, axis=0)
+        mean_pert_true = np.mean(np.expm1(X_pert_true), axis=0)
+
+        # Calculate true log2 Fold Change
+        # Add a tiny epsilon to avoid log(0) if necessary, though log1p data handles this well.
+        epsilon = 1e-9
+        true_logfc = np.log2((mean_pert_true + 1e-9) / (mean_control_true + 1e-9))
+        
+        # Calculate true p-values using Wilcoxon (Mann-Whitney U)
+        _, true_pvals = stats.mannwhitneyu(X_pert_true, X_control_true, axis=0, alternative='two-sided')
+        
+        # Apply FDR Correction
+        _, true_pvals_adj, _, _ = multipletests(true_pvals, alpha=fdr_thresh, method='fdr_bh')
+
+        # Define Ground Truth Indicator Z (1 if DE, 0 if not) using paper's thresholds: p < p_thresh and |logFC| > logfc_thresh
+        Z_true = ((true_pvals_adj < fdr_thresh) & (np.abs(true_logfc) > logfc_thresh)).astype(int)
+        
+        # predicted DEGs (In Silico vs In Vitro Control) ---
+        mask_pert_pred = adata_pred.obs[pert_col] == pert
+        X_pert_pred = adata_pred[mask_pert_pred].X.toarray() if hasattr(adata_pred.X, 'toarray') else adata_pred[mask_pert_pred].X
+        #mean_pert_pred = np.mean(X_pert_pred, axis=0)
+        mean_pert_pred = np.mean(np.expm1(X_pert_pred), axis=0)
+
+        # Calculate predicted log2 Fold Change
+        pred_logfc = np.log2((mean_pert_pred + 1e-9) / (mean_control_true + 1e-9))
+        
+        # Calculate predicted p-values using Wilcoxon
+        _, pred_pvals = stats.mannwhitneyu(X_pert_pred, X_control_true, axis=0, alternative='two-sided')
+
+        # Apply FDR Correction
+        _, pred_pvals_adj, _, _ = multipletests(pred_pvals, alpha=fdr_thresh, method='fdr_bh')
+        
+        # Calculate Ranking Score R_g = |predicted_logFC| * Indicator(predicted_pval < p_thresh)
+        indicator_pred = (pred_pvals_adj < fdr_thresh).astype(int)
+        R_score = np.abs(pred_logfc) * indicator_pred
+
+        # print('ok è questo:')
+        # print(np.isnan(indicator_pred).any())
+        # print(np.isinf(indicator_pred).any())
+        # print('---------')
+
+        # print('ok è questo 2:')
+        # print(np.isnan(pred_logfc).any())
+        # print(np.isinf(pred_logfc).any())
+        # print('---------')
+        # calculate AUPRC
+
+        # Handle edge cases where there are no true DEGs for a perturbation
+        if np.sum(Z_true) == 0:
+            print(f"Skipping {pert}: 0 Ground Truth DEGs found.")
+            continue
+            
+        # precision, recall, _ = precision_recall_curve(Z_true, R_score)
+        # model_auprc = auc(recall, precision)
+        # print(np.isnan(Z_true).any())
+        # print(np.isnan(R_score).any())
+        model_auprc = average_precision_score(Z_true, R_score)
+        
+        # Calculate Baseline AUPRC (Number of DEGs / Total Genes)
+        baseline_auprc = np.sum(Z_true) / len(Z_true)
+        
+        results.append({
+            'perturbation': pert,
+            'num_true_degs': np.sum(Z_true),
+            'baseline_auprc': baseline_auprc,
+            'model_auprc': model_auprc
+        })
+        
+    # --- D. SUMMARIZE RESULTS ---
+    df_results = pd.DataFrame(results)
+    
+    print("\n--- Summary ---")
+    print(f"Average Baseline AUPRC: {df_results['baseline_auprc'].mean():.4f}")
+    print(f"Average Model AUPRC:    {df_results['model_auprc'].mean():.4f}")
+    
+    return df_results
