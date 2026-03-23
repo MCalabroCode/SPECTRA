@@ -29,19 +29,6 @@ else:
     device = torch.device('cpu')
 print(device)
 
-# hyperparameters, metadata and stuff
-config = dict(
-    dataset_size=50000,
-    test_ratio=0.2,
-    val_ratio=0.1,
-    batch_size=48,
-    n_channels=24,
-    edge_dropout_p=0.0,
-    lr=0.001,
-    n_epochs=20,
-    dataset="VCC",
-    architecture="DirGCNConv(ChebConv)")
-
 
 # Initialize wandb run
 wandb.init(
@@ -49,7 +36,6 @@ wandb.init(
     name="SkipConnections_full_48",   # (Optional) Name of this specific run
     config=config               # Pass your dictionary here!
 )
-
 
 ####### data and network loading and filtering
 
@@ -100,141 +86,31 @@ gene_to_idx = {node: i for i, node in enumerate(adata.var_names)}
 G = nx.relabel_nodes(G, gene_to_idx)
 edge_index = from_networkx(G, group_edge_attrs='all').edge_index 
 
+# hyperparameters, metadata and stuff
+config = dict(
+    dataset_size=adata.shape[0],
+    test_ratio=0.2,
+    val_ratio=0.1,
+    batch_size=48,
+    n_channels=24,
+    edge_dropout_p=0.0,
+    lr=0.001,
+    n_epochs=20,
+    dataset="VCC",
+    architecture="DirGCNConv(MixHop)")
+
+# Initialize wandb run
+wandb.init(
+    project="spectra-v2",       # The name of your project in wandb
+    name="MixHop",   # (Optional) Name of this specific run
+    config=config               # Pass your dictionary here!
+)
 
 ######## dataloaders preparation
 
-# a special batch sampler that groups only cells from the same interventional distribution into a batch
-class SCDATA_sampler(Sampler):
-    def __init__(self, data, batchsize, ptb_name=None):
-        self.intervindices = []
-        self.len = 0
-        if ptb_name is None:
-            ptb_name = data.ptb_names
+from utils import build_model_dataloaders
 
-        for ptb in set(ptb_name):
-            idx = np.where(ptb_name == ptb)[0] # indices of cells with the same pert ptb
-            self.intervindices.append(idx) # list of indices of cells with the same pert ptb
-            self.len += len(idx) // batchsize # number of batches with pert ptb
-        self.batchsize = batchsize
-    
-    def __iter__(self):
-        comb = []
-        # loop over each intervention
-        for i in range(len(self.intervindices)):
-            random.shuffle(self.intervindices[i]) # intra-Perturbation Shuffle
-            interv_batches = chunk(self.intervindices[i], self.batchsize)
-            if interv_batches:
-                comb += interv_batches
-
-        combined = [batch.tolist() for batch in comb]
-        random.shuffle(combined) # shuffle the order of the batches
-        return iter(combined)
-
-    def __len__(self):
-        return self.len
-
-
-def chunk(indices, chunk_size):
-    split = torch.split(torch.tensor(indices), chunk_size) # this divides the torch indices into subsets of equal length chunk_size
-    
-    if len(indices) % chunk_size == 0:
-        return split
-    elif len(split) > 0:
-        return split[:-1]
-    else:
-        return None
-
-
-class PerturbationDataset(Dataset):
-    def __init__(self, adata, gene_to_idx, start_idx=0, end_idx=None, seed=42):
-        super().__init__()
-
-        self.edge_index = edge_index.share_memory_()
-        self.gene_to_idx = gene_to_idx
-        self.start_idx = start_idx
-        self.seed = seed
-        self.end_idx = end_idx if end_idx is not None else len(adata)
-
-        adata = adata[self.start_idx:self.end_idx].copy()
-        self.adata = adata
-
-        # perturbed samples
-        ptb_adata = adata[adata.obs['target_gene']!='non-targeting'].copy()
-        ptb_samples = ptb_adata.X.toarray() if hasattr(ptb_adata.X, 'toarray') else np.asarray(ptb_adata.X)
-        self.ptb_samples = torch.tensor(ptb_samples, dtype=torch.float) #NOTE: local to this split
-        self.ptb_names = ptb_adata.obs['target_gene'].values #NOTE: local to this split
-
-        # control samples
-        self.ctrl_samples = adata[adata.obs['target_gene']=='non-targeting'].X.copy()
-        self.ctrl_samples = self.ctrl_samples.toarray() if hasattr(self.ctrl_samples, 'toarray') else np.asarray(self.ctrl_samples)
-        self.ctrl_samples = torch.tensor(self.ctrl_samples, dtype=torch.float)
-
-    def _pert_embedding(self, pert_name):
-        embedding = torch.zeros(self.adata.shape[1], dtype=torch.bool)
-        perturbs = [self.gene_to_idx[g] for g in pert_name.split('+') if g in self.gene_to_idx]
-        for pert in perturbs:
-            embedding[pert]=True
-        return embedding
-
-    def __getitem__(self, idx):
-        
-        # Map to actual index in adata
-        actual_idx = idx
-
-        #x = self.rand_ctrl_samples[actual_idx].view(-1,1)
-        j = np.random.randint(0, self.ctrl_samples.shape[0]) #random control cell
-        x = self.ctrl_samples[j].view(-1,1)
-        y = self.ptb_samples[actual_idx].view(-1,1)
-        pert = self._pert_embedding(self.ptb_names[actual_idx])
-
-        return x,y,pert
-
-    def __len__(self):
-        return self.ptb_samples.shape[0]
-
-
-#TODO: add sanity check for dataset_size (must be inferior than the number of the perturbed cells, see how the sampling works)
-
-# Setup
-dataset_size = (adata.obs['target_gene'] != 'non-targeting').sum() 
-test_ratio = config['test_ratio']
-val_ratio = config['val_ratio']
-test_size = int(dataset_size * test_ratio)
-val_size = int(dataset_size * val_ratio)
-train_size = dataset_size - test_size - val_size
-
-
-# Create datasets
-train_dataset = PerturbationDataset(
-    adata, gene_to_idx,
-    start_idx=0, 
-    end_idx=train_size
-)
-
-val_dataset = PerturbationDataset(
-    adata, gene_to_idx,
-    start_idx=train_size, 
-    end_idx=train_size+val_size
-)
-
-test_dataset = PerturbationDataset(
-    adata, gene_to_idx,
-    start_idx=train_size+val_size, 
-    end_idx=dataset_size
-)
-
-N_WORKERS = 4 #TODO this will be passed as an argument to training load dataset
-batch_size = config['batch_size']
-
-# create loaders
-train_loader = DataLoader(train_dataset, batch_sampler=SCDATA_sampler(train_dataset, batch_size), num_workers=N_WORKERS, pin_memory=True) #pin memory optimize transfer to CUDA
-val_loader = DataLoader(val_dataset, batch_sampler=SCDATA_sampler(val_dataset, batch_size), num_workers=N_WORKERS, pin_memory=True) 
-test_loader = DataLoader(test_dataset, batch_sampler=SCDATA_sampler(test_dataset, batch_size), num_workers=N_WORKERS, pin_memory=True) 
-
-print(f"Train dataset size: {len(train_dataset)}")
-print(f"Test dataset size: {len(test_dataset)}")
-print(f"Validation dataset size: {len(val_dataset)}")
-
+train_loader, val_loader, test_loader = build_model_dataloaders(adata, edge_index, config)
 
 ######### DEG weights
 
@@ -248,8 +124,10 @@ model = PerturbModel(
     device, 
     gene_weights=gene_weights, 
     num_node_features=1, 
-    n_channels=config['n_channels']
+    n_channels=config['n_channels'],
+    edge_dropout_p = config['edge_dropout_p']
 )
+
 model = model.to(device)
 print(model)
 
@@ -269,5 +147,5 @@ _, _, test_wmse = train(model=model,
 
 
 ######### save and close
-torch.save(model.state_dict(), "test_11_mar__chebconv_skipcon.pth")
+torch.save(model.state_dict(), "test_23_mar__mixhop_skipcon.pth")
 wandb.finish()

@@ -6,7 +6,7 @@ from matplotlib.ticker import MaxNLocator
 import os
 import torch
 import torch.nn.functional as F
-from torch_geometric.nn import ChebConv, DirGNNConv, SAGEConv
+from torch_geometric.nn import ChebConv, DirGNNConv, MixHopConv, GATv2Conv
 from torch_geometric.utils import dropout_edge
 from torch.nn import ReLU, LeakyReLU, GELU, LayerNorm
 from magnet import MagNetConv, precompute_magnet_attributes_sparse
@@ -290,12 +290,12 @@ class VariationalGraphEncoder(torch.nn.Module):
     def __init__(self, in_channels, out_channels, dropout_rate = 0.2):
         super().__init__()
         self.out_channels = out_channels
-        self.conv1 = DirGNNConv(ChebConv(in_channels, out_channels, 2)) 
+        self.conv1 = DirGNNConv(ChebConv(in_channels, out_channels, 2)) #2
         self.ln1 = LayerNorm(out_channels)
-        self.conv2 = DirGNNConv(ChebConv(out_channels, 2*out_channels, 2))
+        self.conv2 = DirGNNConv(ChebConv(out_channels, 2*out_channels, 2)) #2
         self.ln2 = LayerNorm(2*out_channels)
-        self.conv_mu = DirGNNConv(ChebConv(2*out_channels, out_channels, 1))  
-        self.conv_logstd = DirGNNConv(ChebConv(2*out_channels, out_channels, 1))
+        self.conv_mu = DirGNNConv(ChebConv(2*out_channels, out_channels, 1))  #1
+        self.conv_logstd = DirGNNConv(ChebConv(2*out_channels, out_channels, 1)) #1
         self.dropout_rate = dropout_rate
 
     def forward(self, x, edge_index):
@@ -342,9 +342,9 @@ class FeatureDecoder(torch.nn.Module):
     '''
     def __init__(self, n_channels, num_node_features, dropout_rate=0.1):
         super().__init__()
-        self.conv1 = DirGNNConv(ChebConv(n_channels, n_channels, 2))
+        self.conv1 = DirGNNConv(ChebConv(n_channels, n_channels, 2)) #2
         self.ln1 = LayerNorm(n_channels)
-        self.conv2 = DirGNNConv(ChebConv(n_channels, n_channels, 2))
+        self.conv2 = DirGNNConv(ChebConv(n_channels, n_channels, 2)) #2
         self.ln2 = LayerNorm(n_channels)
         self.dropout_rate = dropout_rate
         self.last_layer = torch.nn.Linear(n_channels, num_node_features) 
@@ -882,7 +882,7 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
         
         # validation
         if epoch!=0:
-            _, avg_feat_err = 0,0#test_perturb_model(model, test_loader, model.device)
+            _, avg_feat_err = test_perturb_model(model, test_loader, model.device)
             test_wmse.append(avg_feat_err)
 
             # routine for plotting traning/testing metrics during the training
@@ -926,9 +926,9 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
                 "train/cosine_loss": epoch_cos,
             }
 
-            # # Only log validation metric if it was calculated
-            # if avg_feat_err is not None:
-            #     log_metrics["val/test_wmse"] = avg_feat_err
+            # Only log validation metric if it was calculated
+            if avg_feat_err is not None:
+                log_metrics["val/test_MMD"] = avg_feat_err
                 
             wandb.log(log_metrics)
 

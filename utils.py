@@ -183,7 +183,7 @@ def build_model_dataloaders(adata, edge_index, config):
     print(f"Test dataset size: {len(test_dataset)}")
     print(f"Validation dataset size: {len(val_dataset)}")
 
-    return train_loader, val_loader, test_loader
+    return train_loader, val_loader, test_loader, len(train_dataset), len(test_dataset), len(val_dataset)
 
 
 ####### data generation #######
