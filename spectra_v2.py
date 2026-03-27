@@ -12,27 +12,29 @@ from torch.nn import ReLU, LeakyReLU, GELU, LayerNorm
 from magnet import MagNetConv, precompute_magnet_attributes_sparse
 
 import wandb
-class MLP(torch.nn.Module):
-    '''
-    MLP auxiliary class
-    '''
-    def __init__(self, sizes, batch_norm=True, dropout=0.2):
-        super(MLP, self).__init__()
-        layers = []
-        for s in range(len(sizes) - 1):
-            layers = layers + [
-                torch.nn.Dropout(p=dropout),
-                torch.nn.Linear(sizes[s], sizes[s + 1]),
-                torch.nn.BatchNorm1d(sizes[s + 1])
-                if batch_norm and s < len(sizes) - 1 else None,
-                torch.nn.ReLU()
-            ]
 
-        layers = [l for l in layers if l is not None][:-1]
-        self.network = torch.nn.Sequential(*layers)
+# class MLP(torch.nn.Module):
+#     '''
+#     MLP auxiliary class
+#     '''
+#     def __init__(self, sizes, batch_norm=True, dropout=0.2):
+#         super(MLP, self).__init__()
+#         layers = []
+#         for s in range(len(sizes) - 1):
+#             layers = layers + [
+#                 torch.nn.Dropout(p=dropout),
+#                 torch.nn.Linear(sizes[s], sizes[s + 1]),
+#                 torch.nn.BatchNorm1d(sizes[s + 1])
+#                 if batch_norm and s < len(sizes) - 1 else None,
+#                 torch.nn.ReLU()
+#             ]
 
-    def forward(self, x):
-        return self.network(x)
+#         layers = [l for l in layers if l is not None][:-1]
+#         self.network = torch.nn.Sequential(*layers)
+
+#     def forward(self, x):
+#         return self.network(x)
+
 
 # class VariationalGraphEncoder(torch.nn.Module):
 #     def __init__(self, in_channels, out_channels, dropout_rate=0.2):
@@ -403,14 +405,16 @@ class PerturbModel(torch.nn.Module):
     '''
     SPECTRA model class
     '''
-    def __init__(self, edge_index, num_nodes, device, gene_weights=None, num_node_features=1, n_channels=32, edge_dropout_p=0.1):
+    def __init__(self, edge_index, num_nodes, device, gene_weights=None, num_node_features=1, n_channels=32, dropout_p=0.1, architecture_name='ChebConv'):
         super().__init__()
         self.device = device 
         self.num_nodes = num_nodes 
         self.n_channels = n_channels
+        self.dropout_p = dropout_p
+        self.architecture_name = architecture_name
         
         self.register_buffer('edge_index', edge_index)
-        self.edge_dropout_p = edge_dropout_p
+        #self.edge_dropout_p = edge_dropout_p
 
         # Weight Lookup Construction for WMSE
         default_weights = (1/num_nodes)*torch.ones(num_nodes)
@@ -437,8 +441,8 @@ class PerturbModel(torch.nn.Module):
         self.ko_mu = torch.nn.Embedding(num_nodes, 64)
         self.ko_mlp = MLP([64, n_channels, n_channels])
 
-        self.encoder = VariationalGraphEncoder(self.encoder_in_channels, n_channels)
-        self.gex_decoder = FeatureDecoder(n_channels, num_node_features)
+        self.encoder = VariationalGraphEncoder(self.encoder_in_channels, n_channels, dropout_p)
+        self.gex_decoder = FeatureDecoder(n_channels, num_node_features, dropout_p)
         
         self._cached_batch_size = 0
         self._cached_edge_index = None
@@ -490,7 +494,7 @@ class PerturbModel(torch.nn.Module):
         #kl_per_dim_clamped = torch.clamp(kl_per_dim, min=free_bits)
         return torch.mean(kl_per_dim)
 
-    def forward(self, data, return_latent=True):
+    def forward(self, data):
 
         x, pert = data
         x = x.to(self.device) #[B,N,1]
@@ -502,14 +506,14 @@ class PerturbModel(torch.nn.Module):
         x = x.reshape(batch_size * num_nodes, num_features) #[BxN,1]
         pert = pert.reshape(batch_size * num_nodes) #[BxN]
 
-        # Edge Dropout
-        if self.training and self.edge_dropout_p > 0:
-            edge_index_batch, _ = dropout_edge(
-                edge_index_batch, 
-                p=self.edge_dropout_p, 
-                force_undirected=False,
-                training=self.training
-            )
+        # # Edge Dropout
+        # if self.training and self.edge_dropout_p > 0:
+        #     edge_index_batch, _ = dropout_edge(
+        #         edge_index_batch, 
+        #         p=self.edge_dropout_p, 
+        #         force_undirected=False,
+        #         training=self.training
+        #     )
 
         mu, logstd = self.encoder(x, edge_index_batch) # both [BxN, C] (C = hidden channels dimension)
         logstd = torch.clamp(logstd, min=-20, max=10) # this is to avoid inf values
@@ -739,7 +743,7 @@ def train_step_perturb_model(model, data, device, alpha=1., beta=1., mmd_gamma=0
     x_pred = x_hat.view(B, N)
     y_pred = y_hat.view(B, N)
 
-    # ---- NEW: Extract perturbation weights for this batch ----
+    # Extract perturbation weights for this batch
     pert_idx = pert[0].int().argmax().item()
     batch_weights = model.weight_lookup[pert_idx].to(device).reshape(-1)
 
@@ -776,11 +780,10 @@ def train_step_perturb_model(model, data, device, alpha=1., beta=1., mmd_gamma=0
     return total_loss, loss_mmd_y, loss_mmd_x, kl_div, loss_cosine, loss_feat
 
 @torch.no_grad()
-def test_perturb_model(model, loader, device, wmse=True):
+def test_perturb_model(model, loader, device):
     model.eval()
-    feat_err = []
     pert_mmd = []
-    for i, data in enumerate(tqdm(loader, desc='testing with WMSE...')):
+    for i, data in enumerate(tqdm(loader, desc='testing with MMD...')):
         x, y, pert = data
         x, y, pert = x.to(device), y.to(device), pert.to(device)
 
@@ -790,23 +793,11 @@ def test_perturb_model(model, loader, device, wmse=True):
         y_hat, _ = model((x,pert)) #[B*N,1]
         y_flat = y.reshape(-1, 1) #[B*N,1]
 
-        if wmse:
-            batch_size = pert.shape[0]
-            pert_idx = pert[0].int().argmax().item() #TODO: one-hot (does not expect more True values - doesn't adapt to multiple perturbations)
-            weights = model.weight_lookup[pert_idx].to(device).reshape(-1) #[N]
-
-            squared_error = (y_hat - y_flat).pow(2).reshape(batch_size, -1) #[B,N]
-            loss_per_cell = torch.sum(squared_error * weights.unsqueeze(0), dim=1)
-            error = torch.mean(loss_per_cell)
-        else:
-            error = F.mse_loss(y_hat, y_flat)
-        feat_err.append(error.item())
         mmd_error = compute_mmd(y_flat.view(B,N), y_hat.view(B,N))
         pert_mmd.append(mmd_error.item())
 
-    avg_feat_err = sum(feat_err)/len(feat_err)
-    avg_pert_mmd = sum(pert_mmd)/len(feat_err)
-    return avg_feat_err, avg_pert_mmd
+    avg_pert_mmd = sum(pert_mmd)/len(pert_mmd)
+    return avg_pert_mmd
 
 
 def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support, live_plot):
@@ -816,6 +807,8 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
     mmd_ctrl = []
     test_wmse = []
     
+    batch_size = train_loader[0].shape[0]
+
     accumulation_steps = 1
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, fused=True, weight_decay=0.0001)
 
@@ -877,12 +870,12 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
         print(f'training KL = {epoch_kl:.5f} | mse = {epoch_mse:.3f} | cos = {epoch_cos:.3f}')
 
         # save current epoch weights
-        filepath = os.path.join(weights_dir, f"echoes_weights_epoch_{epoch}.pth")
+        filepath = os.path.join(weights_dir, f"weights_epoch_{epoch}__nodes-{model.num_nodes}_b-{batch_size}_h-{model.n_channels}_p-{model.dropout_p}__model-{model.architecture_name}.pth")
         torch.save(model.state_dict(), filepath)
         
         # validation
         if epoch!=0:
-            _, avg_feat_err = test_perturb_model(model, test_loader, model.device)
+            avg_feat_err = test_perturb_model(model, test_loader, model.device)
             test_wmse.append(avg_feat_err)
 
             # routine for plotting traning/testing metrics during the training

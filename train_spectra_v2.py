@@ -29,14 +29,6 @@ else:
     device = torch.device('cpu')
 print(device)
 
-
-# Initialize wandb run
-wandb.init(
-    project="spectra-v2",       # The name of your project in wandb
-    name="SkipConnections_full_48",   # (Optional) Name of this specific run
-    config=config               # Pass your dictionary here!
-)
-
 ####### data and network loading and filtering
 
 adata = sc.read_h5ad('../data/vcc_data/adata_Training.h5ad') #VCC
@@ -91,18 +83,18 @@ config = dict(
     dataset_size=adata.shape[0],
     test_ratio=0.2,
     val_ratio=0.1,
-    batch_size=48,
+    batch_size=24,
     n_channels=24,
     edge_dropout_p=0.0,
     lr=0.001,
     n_epochs=20,
     dataset="VCC",
-    architecture="DirGCNConv(MixHop)")
+    architecture="DirGCNConv(ChebConv)")
 
 # Initialize wandb run
 wandb.init(
     project="spectra-v2",       # The name of your project in wandb
-    name="MixHop",   # (Optional) Name of this specific run
+    name="DirGNN(Cheb)",   # (Optional) Name of this specific run
     config=config               # Pass your dictionary here!
 )
 
@@ -110,7 +102,7 @@ wandb.init(
 
 from utils import build_model_dataloaders
 
-train_loader, val_loader, test_loader = build_model_dataloaders(adata, edge_index, config)
+train_loader, val_loader, test_loader, train_size, test_size, _ = build_model_dataloaders(adata, edge_index, config)
 
 ######### DEG weights
 
@@ -131,10 +123,6 @@ model = PerturbModel(
 model = model.to(device)
 print(model)
 
-num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(f'number of parameters: {num_trainable_params}')
-
-
 ########## training
 _, _, test_wmse = train(model=model, 
     train_loader=train_loader, 
@@ -147,5 +135,5 @@ _, _, test_wmse = train(model=model,
 
 
 ######### save and close
-torch.save(model.state_dict(), "test_23_mar__mixhop_skipcon.pth")
+torch.save(model.state_dict(), "test_DirGNN_Cheb.pth")
 wandb.finish()
