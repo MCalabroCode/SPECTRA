@@ -405,13 +405,15 @@ class PerturbModel(torch.nn.Module):
     '''
     SPECTRA model class
     '''
-    def __init__(self, edge_index, num_nodes, device, gene_weights=None, num_node_features=1, n_channels=32, dropout_p=0.1, architecture_name='ChebConv'):
+    def __init__(self, edge_index, num_nodes, device, config, gene_weights=None):
         super().__init__()
         self.device = device 
+
         self.num_nodes = num_nodes 
-        self.n_channels = n_channels
-        self.dropout_p = dropout_p
-        self.architecture_name = architecture_name
+        self.n_channels = config['n_channels']
+        self.dropout_p = config['dropout_p']
+        self.architecture_name = config['architecture']
+        self.num_node_features = config['num_node_features'] 
         
         self.register_buffer('edge_index', edge_index)
         #self.edge_dropout_p = edge_dropout_p
@@ -439,17 +441,20 @@ class PerturbModel(torch.nn.Module):
         # torch.nn.init.xavier_uniform_(self.ko_token.weight)
 
         self.ko_mu = torch.nn.Embedding(num_nodes, 64)
-        self.ko_mlp = MLP([64, n_channels, n_channels])
+        self.ko_mlp = MLP([64, self.n_channels, self.n_channels])
 
-        self.encoder = VariationalGraphEncoder(self.encoder_in_channels, n_channels, dropout_p)
-        self.gex_decoder = FeatureDecoder(n_channels, num_node_features, dropout_p)
+        self.encoder = VariationalGraphEncoder(self.encoder_in_channels, self.n_channels, self.dropout_p)
+        self.gex_decoder = FeatureDecoder(self.n_channels, self.num_node_features, self.dropout_p)
         
         self._cached_batch_size = 0
         self._cached_edge_index = None
         self._cached_gene_ids = None
 
         num_trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        
+        print('========================================')
         print(f'number of trainable parameters: {num_trainable_params}')
+        print('========================================')
     
     def _get_batched_edge_index(self, batch_size):
         '''
@@ -807,7 +812,8 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
     mmd_ctrl = []
     test_wmse = []
     
-    batch_size = train_loader[0].shape[0]
+    first_batch = next(iter(train_loader))
+    batch_size = first_batch[0].shape[0]
 
     accumulation_steps = 1
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, fused=True, weight_decay=0.0001)

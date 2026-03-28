@@ -17,7 +17,7 @@ sc.settings.verbosity = 0
 import warnings
 warnings.filterwarnings('ignore')
 
-def MAE_error(real_adata, pred_adata):
+def calc_mae(real_adata, pred_adata):
     assert set(real_adata.obs['target_gene'].values) == set(pred_adata.obs['target_gene'].values), "perturbations not matching"
 
     mae = {}
@@ -37,12 +37,9 @@ def MAE_error(real_adata, pred_adata):
 
         mae[pert] = np.mean(np.abs(mean_real - mean_pred))
 
-    print(mae)
-    print('=====')
-    avg = np.mean(list(mae.values()))
-    print(f'average over all the perturbations: {avg}')
+    return mae
 
-def corr_error(real_adata, pred_adata, correlation='pearson'):
+def calc_corr(real_adata, pred_adata, correlation='pearson'):
     assert set(real_adata.obs['target_gene'].values) == set(pred_adata.obs['target_gene'].values), "perturbations not matching"
 
     corr = {}
@@ -63,17 +60,10 @@ def corr_error(real_adata, pred_adata, correlation='pearson'):
             r = stats.spearmanr(real_mean, pred_mean)[0]
         else:
             r = stats.pearsonr(real_mean, pred_mean)[0]
-        # if correlation=='spearman':
-        #     corrs = [stats.spearmanr(selected_real[:, i], selected_pred[:, i])[0] for i in range(selected_pred.shape[1])]
-        # else:
-        #     corrs = [stats.pearsonr(selected_real[:, i], selected_pred[:, i])[0] for i in range(selected_pred.shape[1])]
         
-        corr[pert] = r#np.nanmean(corrs)
+        corr[pert] = r
 
-    print(corr)
-    print('=====')
-    avg = np.nanmean(list(corr.values()))
-    print(f'average over all the perturbations: {avg}')
+    return corr
 
 
 ########################################################
@@ -134,41 +124,7 @@ class RobustDES:
         
         return de_genes_df[['names', 'logfoldchanges']].set_index('names'), result_df
 
-    def calculate_score(self, adata_true, adata_pred, perturbation_key, perturb_label, control_label):
-        """
-        Calculates the Modified Differential Expression Score (DES), VCC
-        """
-        # identify True DE Genes (G_true)
-        df_true, result_df_true = self.get_de_genes(adata_true, perturbation_key, perturb_label, control_label)
-        G_true = set(df_true.index)
-        n_true = len(G_true)
-
-        if n_true == 0:
-            return 0.0 # Avoid division by zero, or handle as specific case
-
-        # identify Predicted DE Genes (G_pred)
-        df_pred, result_df_pred = self.get_de_genes(adata_pred, perturbation_key, perturb_label, control_label)
-        G_pred_full = set(df_pred.index)
-        n_pred = len(G_pred_full)
-
-        # calculate Intersection based on set sizes (VCC logic, TODO: probably must be changed
-        if n_pred <= n_true:
-            intersection = G_pred_full.intersection(G_true)
-            score = len(intersection) / n_true
-        else:
-            # "Select n_true genes with the largest absolute values of log fold changes"
-            df_pred['abs_lfc'] = df_pred['logfoldchanges'].abs()
-            top_genes_df = df_pred.sort_values('abs_lfc', ascending=False).head(n_true)
-            
-            G_pred_top = set(top_genes_df.index)
-            
-            # Intersection with the top filtered set
-            intersection = G_pred_top.intersection(G_true)
-            score = len(intersection) / n_true
-
-        return score
-
-    def calculate_precision_score(self, adata_true, adata_pred, perturbation_key, perturb_label, control_label):
+    def _core_precision(self, adata_true, adata_pred, perturbation_key, perturb_label, control_label):
         """
         Calculates the Modified Differential Expression Score (DES) for perturb_label
         here we don't have a recall but another binary classification score
@@ -185,8 +141,8 @@ class RobustDES:
         df_pred, result_df_pred = self.get_de_genes(adata_pred, perturbation_key, perturb_label, control_label)
         G_pred = set(df_pred.index)
         n_pred = len(G_pred)
-        print(f'pert {perturb_label} - n_true = {n_true}, n_pred = {n_pred}')
-        print(perturb_label in G_pred)
+        # print(f'pert {perturb_label} - n_true = {n_true}, n_pred = {n_pred}')
+        # print(perturb_label in G_pred)
 
         # true positives
         TP = G_pred.intersection(G_true)
@@ -194,7 +150,7 @@ class RobustDES:
 
         return score
 
-    def calculate_f1_score(self, adata_true, adata_pred, perturbation_key, perturb_label, control_label):
+    def _core_f1(self, adata_true, adata_pred, perturbation_key, perturb_label, control_label):
 
         # identify True DE Genes (G_true)
         df_true, result_df_true = self.get_de_genes(adata_true, perturbation_key, perturb_label, control_label)
@@ -208,7 +164,7 @@ class RobustDES:
         df_pred, result_df_pred = self.get_de_genes(adata_pred, perturbation_key, perturb_label, control_label)
         G_pred = set(df_pred.index)
         n_pred = len(G_pred)
-        print(f'pert {perturb_label} - n_true = {n_true}, n_pred = {n_pred}')
+        # print(f'pert {perturb_label} - n_true = {n_true}, n_pred = {n_pred}')
 
         # true positives
         TP = G_pred.intersection(G_true)
@@ -251,36 +207,41 @@ class RobustDES:
         plt.show()
         return mean_cm
 
-    def calculate_AUPRC_score(self, adata_true, adata_pred, perturbation_key, perturb_label, control_label):
-        """
-        AUPRC paper
-        """
-        # identify True DE Genes (G_true)
-        df_true, result_df_true = self.get_de_genes(adata_true, perturbation_key, perturb_label, control_label)
-        G_true = set(df_true.index)
-        n_true = len(G_true)
+def calc_f1(real_adata, pred_adata, lfc_threshold=0.3, alpha=0.01):
 
-        if n_true == 0:
-            return 0.0 # Avoid division by zero, or handle as specific case
+    des_calculator = RobustDES(lfc_threshold=lfc_threshold, alpha=alpha)
 
-        # identify Predicted DE Genes (G_pred)
-        df_pred, result_df_pred = self.get_de_genes(adata_pred, perturbation_key, perturb_label, control_label)
-        G_pred = set(df_pred.index)
-        n_pred = len(G_pred)
-        print(f'pert {perturb_label} - n_true = {n_true}, n_pred = {n_pred}')
-        print(perturb_label in G_pred)
+    assert set(real_adata.obs['target_gene'].unique()) == set(pred_adata.obs['target_gene'].unique()), "perturbations do not match"
 
-        # true positives
-        TP = G_pred.intersection(G_true)
-        score = len(TP)/(n_pred+1e-8)
+    perts = [pert for pert in real_adata.obs['target_gene'].unique() if pert != 'non-targeting']
+    scores = {}
+    for pert in tqdm(perts):
+        scores[pert] = des_calculator._core_f1(real_adata, pred_adata, 'target_gene', pert, 'non-targeting')
+        # print(f'score: {scores[pert]}')
+        # print('---------------------')
 
-        return score
+    return scores
+
+def calc_precision(real_adata, pred_adata, lfc_threshold=0.3, alpha=0.01):
+
+    des_calculator = RobustDES(lfc_threshold=lfc_threshold, alpha=alpha)
+
+    assert set(real_adata.obs['target_gene'].unique()) == set(pred_adata.obs['target_gene'].unique()), "perturbations do not match"
+
+    perts = [pert for pert in real_adata.obs['target_gene'].unique() if pert != 'non-targeting']
+    scores = {}
+    for pert in tqdm(perts):
+        scores[pert] = des_calculator._core_precision(real_adata, pred_adata, 'target_gene', pert, 'non-targeting')
+        # print(f'score: {scores[pert]}')
+        # print('---------------------')
+
+    return scores
 
 ########################################################
 ##################### AUPRC SCORE ######################
 ########################################################
 
-def calculate_auprc_score(adata_true, adata_pred, pert_col='target_gene', control_name='non-targeting', fdr_thresh=0.01, logfc_thresh=0.3):
+def calc_auprc(adata_true, adata_pred, pert_col='target_gene', control_name='non-targeting', fdr_thresh=0.01, logfc_thresh=0.3):
     """
     Calculates AUPRC for predicted scRNA-seq perturbation responses.
     Assumes adata.X contains log-normalized counts (e.g., log1p).
@@ -297,7 +258,8 @@ def calculate_auprc_score(adata_true, adata_pred, pert_col='target_gene', contro
 
     perturbations = [p for p in adata_true.obs[pert_col].unique() if p != control_name]
     
-    results = []
+    model_results = {}
+    baseline_results = {}
     
     for pert in tqdm(perturbations):
 
@@ -340,46 +302,31 @@ def calculate_auprc_score(adata_true, adata_pred, pert_col='target_gene', contro
         indicator_pred = (pred_pvals_adj < fdr_thresh).astype(int)
         R_score = np.abs(pred_logfc) * indicator_pred
 
-        # print('ok è questo:')
-        # print(np.isnan(indicator_pred).any())
-        # print(np.isinf(indicator_pred).any())
-        # print('---------')
-
-        # print('ok è questo 2:')
-        # print(np.isnan(pred_logfc).any())
-        # print(np.isinf(pred_logfc).any())
-        # print('---------')
-        # calculate AUPRC
-
         # Handle edge cases where there are no true DEGs for a perturbation
         if np.sum(Z_true) == 0:
             print(f"Skipping {pert}: 0 Ground Truth DEGs found.")
             continue
-            
-        # precision, recall, _ = precision_recall_curve(Z_true, R_score)
-        # model_auprc = auc(recall, precision)
-        # print(np.isnan(Z_true).any())
-        # print(np.isnan(R_score).any())
-        model_auprc = average_precision_score(Z_true, R_score)
+
+        model_results[pert] = average_precision_score(Z_true, R_score)
         
         # Calculate Baseline AUPRC (Number of DEGs / Total Genes)
-        baseline_auprc = np.sum(Z_true) / len(Z_true)
+        baseline_results[pert] = np.sum(Z_true) / len(Z_true)
         
-        results.append({
-            'perturbation': pert,
-            'num_true_degs': np.sum(Z_true),
-            'baseline_auprc': baseline_auprc,
-            'model_auprc': model_auprc
-        })
+        # results.append({
+        #     'perturbation': pert,
+        #     'num_true_degs': np.sum(Z_true),
+        #     'baseline_auprc': baseline_auprc,
+        #     'model_auprc': model_auprc
+        # })
         
-    # --- D. SUMMARIZE RESULTS ---
-    df_results = pd.DataFrame(results)
+    # # --- D. SUMMARIZE RESULTS ---
+    # df_results = pd.DataFrame(results)
     
     print("\n--- Summary ---")
-    print(f"Average Baseline AUPRC: {df_results['baseline_auprc'].mean():.4f}")
-    print(f"Average Model AUPRC:    {df_results['model_auprc'].mean():.4f}")
+    print(f"Average Baseline AUPRC: {sum(baseline_results.values())/len(baseline_results):.4f}")
+    print(f"Average Model AUPRC:    {sum(model_results.values())/len(model_results):.4f}")
     
-    return df_results
+    return model_results, baseline_results
 
 ########################################################
 ################## BENCHMARK METRICS ###################
@@ -479,7 +426,8 @@ def evaluate_metric_per_perturbation(adata_true, adata_pred, metric_func, contro
             adata_sub = adata_sub[:, top_true_degs].copy()
             
         # Calculate metric
-        score = metric_func(adata_sub, **kwargs)
+        with SuppressOutput():
+            score = metric_func(adata_sub, **kwargs)
         results[pert] = score
         
     return results

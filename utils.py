@@ -20,33 +20,25 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.sampler import Sampler
 import random
 
-#TODO: must be adapted for SPECTRA
-def load_model_config(config_file_path: str):
-    ''' import json configuration file for the model
+def data_preprocessing(adata, condition_col, control_tag, min_genes=200, min_cells=3, min_cells_per_sample=100):
 
-    Args:
-        config_file_path (str): path to the configuration file
-    Retruns:
-        args: List of arguments and hyperparameters for the model
-    '''
-    
-    # First, check if the configuration file exists.
-    if not os.path.exists(config_file_path):
-        raise ValueError(f"Error: The configuration file '{config_file_path}' was not found.")
-    else:
-        with open(config_file_path, 'r') as f:
-            config = json.load(f)
+    # Rename column and ctrl samples
+    adata.obs = adata.obs.rename(columns={condition_col: "target_gene"})
+    adata.obs["target_gene"] = adata.obs["target_gene"].str.replace(control_tag, "non-targeting", regex=False)
+    adata.obs['target_gene'] = adata.obs['target_gene'].str.replace(r'\+non-targeting$', '', regex=True)
 
-    # Convert the dictionary into a namespace object for easy access (e.g., args.epochs)
-    args = argparse.Namespace(**config)
+    sc.pp.filter_cells(adata, min_genes=min_genes)
+    sc.pp.filter_genes(adata, min_cells=min_cells) # TODO: should be 3 but if so I would have to recalculate the GRN....
+    adata.raw = adata.copy() 
+    sc.pp.normalize_total(adata, target_sum = 1e4)
+    sc.pp.log1p(adata)
 
-    print("Configuration successfully loaded from JSON:")
-    print(f"Epochs: {args.epochs}")
-    print(f"Number of channels: {args.n_channels}")
-    print(f"Learning rate: {args.lr}")
-    print(f"Test ratio: {args.test_ratio}")
+    # select only perturbations that are present in at least min_cells_per_sample cells
+    counts = adata.obs['target_gene'].value_counts()
+    valid_pert = counts[counts >= min_cells_per_sample].index
+    adata = adata[adata.obs['target_gene'].isin(valid_pert)]
+    return adata
 
-    return args
 
 class SCDATA_sampler(Sampler):
     '''
@@ -92,8 +84,6 @@ def chunk(indices, chunk_size):
         return split[:-1]
     else:
         return None
-
-
 
 class PerturbationDataset(Dataset):
     def __init__(self, adata, gene_to_idx, edge_index, start_idx=0, end_idx=None):
@@ -252,7 +242,6 @@ def generate_adata_baseline(gene_counts_dict, train_adata, var_names):
     
     return pred_adata
 
-
 def technical_duplicate_baseline(adata):
     '''
     We compute this baseline by randomly dividing the population of cells 
@@ -271,9 +260,7 @@ def technical_duplicate_baseline(adata):
     pred_adata = adata[indices_2].copy()
     return pred_adata
 
-
-
-def generate_adata_from_control(gene_counts_dict, real_adata, model, gene_to_idx, var_names, batch_size=32):
+def generate_adata_from_control(gene_counts_dict, real_adata, model, gene_to_idx, var_names, batch_size=32, add_control=True):
 
     prediction_list = []
     obs_gene_list = []
@@ -321,10 +308,25 @@ def generate_adata_from_control(gene_counts_dict, real_adata, model, gene_to_idx
     obs = pd.DataFrame({"target_gene": obs_gene_list})
     var = pd.DataFrame(index=var_names)
     pred_adata = ad.AnnData(X=X, obs=obs, var=var)
-    
+
+    if add_control:
+        # Append the non-targeting controls to the example anndata if they're missing
+        if "non-targeting" not in pred_adata.obs["target_gene"].unique():
+            assert np.all(pred_adata.var_names.values == real_adata_control.var_names.values), (
+                "Gene-Names are out of order or unequal"
+            )
+            pred_adata = ad.concat(
+                [
+                    pred_adata,
+                    real_adata_control,
+                ]
+            )
+
     return pred_adata
 
-def generate_adata_from_control_old(gene_counts_dict, real_adata, model, gene_to_idx, var_names):
+################################
+
+def _generate_adata_from_control(gene_counts_dict, real_adata, model, gene_to_idx, var_names):
     '''
     this code is not optimized. Do not use.
     '''
