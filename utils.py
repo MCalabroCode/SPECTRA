@@ -13,6 +13,7 @@ from scipy import sparse
 import anndata as ad
 import pandas as pd
 import torch
+import scanpy as sc
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
@@ -20,7 +21,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.sampler import Sampler
 import random
 
-def data_preprocessing(adata, condition_col, control_tag, min_genes=200, min_cells=3, min_cells_per_sample=100):
+def data_preprocessing(adata, condition_col, control_tag, min_genes=200, min_cells=3, min_cells_per_sample=100, logtransform=True):
 
     # Rename column and ctrl samples
     adata.obs = adata.obs.rename(columns={condition_col: "target_gene"})
@@ -29,9 +30,10 @@ def data_preprocessing(adata, condition_col, control_tag, min_genes=200, min_cel
 
     sc.pp.filter_cells(adata, min_genes=min_genes)
     sc.pp.filter_genes(adata, min_cells=min_cells) # TODO: should be 3 but if so I would have to recalculate the GRN....
-    adata.raw = adata.copy() 
-    sc.pp.normalize_total(adata, target_sum = 1e4)
-    sc.pp.log1p(adata)
+    if logtransform:
+        adata.raw = adata.copy() 
+        sc.pp.normalize_total(adata, target_sum = 1e4)
+        sc.pp.log1p(adata)
 
     # select only perturbations that are present in at least min_cells_per_sample cells
     counts = adata.obs['target_gene'].value_counts()
@@ -87,6 +89,7 @@ def chunk(indices, chunk_size):
 
 class PerturbationDataset(Dataset):
     def __init__(self, adata, gene_to_idx, edge_index, start_idx=0, end_idx=None):
+        #TODO: edge_index can probably be removed
         super().__init__()
 
         self.edge_index = edge_index.share_memory_()
@@ -174,6 +177,122 @@ def build_model_dataloaders(adata, edge_index, config):
     print(f"Validation dataset size: {len(val_dataset)}")
 
     return train_loader, val_loader, test_loader, len(train_dataset), len(test_dataset), len(val_dataset)
+
+def build_model_dataloaders_split_perturbs_leak(adata, edge_index, config):
+    
+    test_ratio = config.get('test_ratio', 0.1)
+    val_ratio = config.get('val_ratio', 0.1)
+    batch_size = config.get('batch_size', 32)
+    N_WORKERS = 4 
+    
+    # Isolate controls and unique perturbations
+    ctrl_adata = adata[adata.obs['target_gene'] == 'non-targeting'].copy()
+    unique_perts = adata.obs['target_gene'].unique().tolist()
+    unique_perts.remove('non-targeting')
+        
+    # Shuffle perturbations to ensure random splits
+    np.random.seed(42) # Optional: for reproducibility
+    np.random.shuffle(unique_perts)
+    
+    # Calculate split sizes based on the NUMBER OF PERTURBATIONS (not cells)
+    num_perts = len(unique_perts)
+    test_size = int(num_perts * test_ratio)
+    val_size = int(num_perts * val_ratio)
+    train_size = num_perts - test_size - val_size
+    
+    # Slice the perturbation lists
+    train_perts = unique_perts[:train_size]
+    val_perts = unique_perts[train_size:train_size + val_size]
+    test_perts = unique_perts[train_size + val_size:]
+    
+    # Build individual adatas (Specific Perturbations + All Control Cells)
+    train_adata = ad.concat([adata[adata.obs['target_gene'].isin(train_perts)], ctrl_adata]) #NOTE: data leakage for control!!! control not splitted
+    val_adata = ad.concat([adata[adata.obs['target_gene'].isin(val_perts)], ctrl_adata])
+    test_adata = ad.concat([adata[adata.obs['target_gene'].isin(test_perts)], ctrl_adata])
+
+    gene_to_idx = {node: i for i, node in enumerate(adata.var_names)}
+
+    # 6. Create datasets 
+    # (Since we pass pre-split adatas, we don't need start_idx/end_idx anymore)
+    train_dataset = PerturbationDataset(train_adata, gene_to_idx, edge_index)
+    val_dataset = PerturbationDataset(val_adata, gene_to_idx, edge_index)
+    test_dataset = PerturbationDataset(test_adata, gene_to_idx, edge_index)
+
+    # Create loaders
+    train_loader = DataLoader(train_dataset, batch_sampler=SCDATA_sampler(train_dataset, batch_size), num_workers=N_WORKERS, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_sampler=SCDATA_sampler(val_dataset, batch_size), num_workers=N_WORKERS, pin_memory=True) 
+    test_loader = DataLoader(test_dataset, batch_sampler=SCDATA_sampler(test_dataset, batch_size), num_workers=N_WORKERS, pin_memory=True) 
+
+    print(f"Total Unique Perturbations: {num_perts}")
+    print(f"Train set: {len(train_perts)} perts | {len(train_dataset)} cells")
+    print(f"Val set: {len(val_perts)} perts | {len(val_dataset)} cells")
+    print(f"Test set: {len(test_perts)} perts | {len(test_dataset)} cells")
+
+    return train_loader, val_loader, test_loader, len(train_dataset), len(test_dataset), len(val_dataset)
+
+def build_model_dataloaders_split_perturbs(adata, edge_index, config):
+    
+    test_ratio = config.get('test_ratio', 0.1)
+    val_ratio = config.get('val_ratio', 0.1)
+    batch_size = config.get('batch_size', 32)
+    N_WORKERS = 4 
+    
+    # Isolate controls and unique perturbations
+    ctrl_adata = adata[adata.obs['target_gene'] == 'non-targeting'].copy()
+    unique_perts = adata.obs['target_gene'].unique().tolist()
+    unique_perts.remove('non-targeting')
+        
+    # Shuffle perturbations to ensure random splits
+    np.random.seed(42) # Optional: for reproducibility
+    np.random.shuffle(unique_perts)
+    
+    # Calculate split sizes based on the NUMBER OF PERTURBATIONS (not cells)
+    num_perts = len(unique_perts)
+    test_size = int(num_perts * test_ratio)
+    val_size = int(num_perts * val_ratio)
+    train_size = num_perts - test_size - val_size
+    
+    # Slice the perturbation lists
+    train_perts = unique_perts[:train_size]
+    val_perts = unique_perts[train_size:train_size + val_size]
+    test_perts = unique_perts[train_size + val_size:]
+
+    #fix of control data leakage: we split control as well
+    num_ctrls = ctrl_adata.shape[0]
+    ctrl_indices = np.random.permutation(num_ctrls)
+
+    test_size_c = int(num_ctrls * test_ratio)
+    val_size_c = int(num_ctrls * val_ratio)
+    train_size_c = num_ctrls - test_size_c - val_size_c
+    
+    train_ctrl = ctrl_adata[ctrl_indices[:train_size_c]]
+    val_ctrl = ctrl_adata[ctrl_indices[train_size_c:train_size_c + val_size_c]]
+    test_ctrl = ctrl_adata[ctrl_indices[train_size_c + val_size_c:]]
+    
+    # Build individual adatas (Specific Perturbations + Split Control Cells)
+    train_adata = ad.concat([adata[adata.obs['target_gene'].isin(train_perts)], train_ctrl])
+    val_adata = ad.concat([adata[adata.obs['target_gene'].isin(val_perts)], val_ctrl])
+    test_adata = ad.concat([adata[adata.obs['target_gene'].isin(test_perts)], test_ctrl])
+
+    gene_to_idx = {node: i for i, node in enumerate(adata.var_names)}
+
+    # 6. Create datasets 
+    # (Since we pass pre-split adatas, we don't need start_idx/end_idx anymore)
+    train_dataset = PerturbationDataset(train_adata, gene_to_idx, edge_index)
+    val_dataset = PerturbationDataset(val_adata, gene_to_idx, edge_index)
+    test_dataset = PerturbationDataset(test_adata, gene_to_idx, edge_index)
+
+    # Create loaders
+    train_loader = DataLoader(train_dataset, batch_sampler=SCDATA_sampler(train_dataset, batch_size), num_workers=N_WORKERS, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_sampler=SCDATA_sampler(val_dataset, batch_size), num_workers=N_WORKERS, pin_memory=True) 
+    test_loader = DataLoader(test_dataset, batch_sampler=SCDATA_sampler(test_dataset, batch_size), num_workers=N_WORKERS, pin_memory=True) 
+
+    print(f"Total Unique Perturbations: {num_perts}")
+    print(f"Train set: {len(train_perts)} perts | {len(train_dataset)} cells")
+    print(f"Val set: {len(val_perts)} perts | {len(val_dataset)} cells")
+    print(f"Test set: {len(test_perts)} perts | {len(test_dataset)} cells")
+
+    return train_loader, val_loader, test_loader, len(train_dataset), len(test_dataset), len(val_dataset), train_adata, val_adata, test_adata
 
 
 ####### data generation #######

@@ -6,83 +6,288 @@ from matplotlib.ticker import MaxNLocator
 import os
 import torch
 import torch.nn.functional as F
-from torch_geometric.nn import ChebConv, DirGNNConv, MixHopConv, GATv2Conv, SAGEConv
+from torch_geometric.nn import FAConv, DirGNNConv, GATv2Conv
 from torch_geometric.utils import dropout_edge
 from torch.nn import ReLU, LeakyReLU, GELU, LayerNorm
-from magnet import MagNetConv, precompute_magnet_attributes_sparse
+#from magnet import MagNetConv, precompute_magnet_attributes_sparse
 
 import wandb
 
+from torch import Tensor
+
+from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import degree
+import torch.nn as nn
+from typing import Optional, Tuple, Dict, Any
 
 
-class PolyLayer(torch.nn.Module):
+
+class DirectedFAGCNConv(MessagePassing):
     """
-    Modular PolyLayer to wrap our directed convolution.
+    Directed FAGCN-style convolution:
+
+        h_i' = eps * x_res_i + 0.5 * [sum_{j in N_in(i)}  alpha_in(i,j) / d_in(i)  * x_j
+                + sum_{k in N_out(i)} alpha_out(i,k) / d_out(i) * x_k]
+
+    where:
+        alpha_in(i,j)  = tanh(g_in([x_i || x_j]))
+        alpha_out(i,k) = tanh(g_out([x_i || x_k]))
+
+    Notes
+    -----
+    - edge_index follows PyG convention:
+        edge_index[0] = source
+        edge_index[1] = target
+    - Incoming neighbors of i are predecessors j -> i.
+    - Outgoing neighbors of i are successors i -> k.
+    - The layer supports optional return of per-edge alpha values.
     """
-    def __init__(self, in_channels, out_channels, conv):
+
+    def __init__(self, channels: int, eps: float = 0.1, share_gates: bool = False, alpha=0.5):
+        super().__init__(aggr="add", node_dim=0)
+
+        self.channels = channels
+        self.eps = eps
+        self.alpha = alpha
+
+        if share_gates:
+            gate = nn.Linear(2 * channels, 1, bias=False)
+            self.gate_in = gate
+            self.gate_out = gate
+        else:
+            self.gate_in = nn.Linear(2 * channels, 1, bias=False)
+            self.gate_out = nn.Linear(2 * channels, 1, bias=False)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.gate_in.weight)
+        if self.gate_out is not self.gate_in:
+            nn.init.xavier_uniform_(self.gate_out.weight)
+
+    def forward(self, x: Tensor, edge_index: Tensor, x_res: Optional[Tensor] = None, 
+        edge_weight: Optional[Tensor] = None, return_alpha: bool = False,) -> Tuple[Tensor, Optional[Dict[str, Tensor]]]:
+        """
+        Parameters
+        ----------
+        x : Tensor
+            Node features of shape [N, C].
+        edge_index : Tensor
+            Graph connectivity in COO format with shape [2, E].
+        x_res : Optional[Tensor]
+            Residual/self feature term. If None, uses x.
+            This is useful if you want FAGCN-style repeated injection of h^(0).
+        edge_weight : Optional[Tensor]
+            Optional scalar weight per edge, shape [E].
+        return_alpha : bool
+            If True, also returns a dict with learned alpha values.
+
+        Returns
+        -------
+        out : Tensor
+            Updated node features [N, C].
+        alpha_dict : Optional[Dict[str, Tensor]]
+            Returned only if return_alpha=True. Contains:
+              - alpha_in: raw alpha for original edges, shape [E]
+              - alpha_out: raw alpha for original edges, shape [E]
+        """
+        if x_res is None:
+            x_res = x
+
+        num_nodes = x.size(0)
+        src, dst = edge_index[0], edge_index[1]
+
+        # Directed degrees on the ORIGINAL graph:
+        deg_in = degree(dst, num_nodes=num_nodes, dtype=x.dtype).clamp(min=1.0)
+        deg_out = degree(src, num_nodes=num_nodes, dtype=x.dtype).clamp(min=1.0)
+
+        # Incoming aggregation: j -> i over original edges
+        out_in = self.propagate(
+            edge_index=edge_index,
+            x=x,
+            gate_nn=self.gate_in,
+            deg_target=deg_in,
+            edge_weight=edge_weight,
+            size=(num_nodes, num_nodes),
+        )
+
+        # Outgoing aggregation: this is equivalent to propagating on reversed edges k -> i.
+        rev_edge_index = torch.stack([dst, src], dim=0)
+        rev_edge_weight = edge_weight  # same edges, only direction reversed
+        out_out = self.propagate(
+            edge_index=rev_edge_index,
+            x=x,
+            gate_nn=self.gate_out,
+            deg_target=deg_out,  # because reversed target = original source
+            edge_weight=rev_edge_weight,
+            size=(num_nodes, num_nodes),
+        )
+
+        #out = self.eps * x_res + 0.5 * (out_in + out_out)
+        out = self.eps * x_res + (1-self.alpha) * out_in + self.alpha * out_out
+
+
+        if not return_alpha:
+            return out
+
+        # Compute raw learned alpha values explicitly for inspection
+        alpha_in = self._compute_alpha(x=x, edge_index=edge_index, gate_nn=self.gate_in)
+
+        # alpha_out is reported on ORIGINAL edges (i -> k), not reversed edges
+        alpha_out = self._compute_alpha(x=x, edge_index=edge_index, gate_nn=self.gate_out)
+
+        alpha_dict = {
+            "alpha_in": alpha_in,    # for edge j -> i, gate uses [x_i || x_j]
+            "alpha_out": alpha_out,  # for edge i -> k, gate uses [x_i || x_k]
+        }
+
+        return out, alpha_dict
+
+    def message(self, x_i: Tensor, x_j: Tensor, index: Tensor, gate_nn: nn.Linear, deg_target: Tensor, edge_weight: Optional[Tensor],
+        ) -> Tensor:
+        """
+        On each propagated edge j -> i:
+            alpha_ij = tanh(g([x_i || x_j]))
+            m_ij = alpha_ij / deg_target[i] * x_j
+        """
+        alpha = torch.tanh(gate_nn(torch.cat([x_i, x_j], dim=-1))).view(-1)
+        norm = 1.0 / deg_target[index]
+        if edge_weight is not None:
+            norm = norm * edge_weight
+        return (alpha * norm).unsqueeze(-1) * x_j
+
+    @torch.no_grad()
+    def _compute_alpha(self, x: Tensor, edge_index: Tensor, gate_nn: nn.Linear) -> Tensor:
+        """
+        Computes raw alpha for ORIGINAL directed edges.
+
+        For an edge u -> v:
+        - if gate_nn == gate_in, alpha corresponds conceptually to alpha_in(v,u)
+          using [x_v || x_u]
+        - if gate_nn == gate_out, alpha corresponds conceptually to alpha_out(u,v)
+          using [x_u || x_v]
+        """
+        src, dst = edge_index[0], edge_index[1]
+
+        if gate_nn is self.gate_in:
+            x_center = x[dst]   # target i
+            x_neigh = x[src]    # source j
+        else:
+            x_center = x[src]   # source i
+            x_neigh = x[dst]    # successor k
+
+        alpha = torch.tanh(gate_nn(torch.cat([x_center, x_neigh], dim=-1))).view(-1)
+        return alpha
+
+
+class DirectedFAGCN(nn.Module):
+    def __init__(self, in_channels: int, hidden_channels: int, out_channels: int, num_layers: int = 2, 
+        eps: float = 0.2,
+        dropout: float = 0.5,
+        share_gates: bool = False,
+    ):
         super().__init__()
-        self.conv = conv
-        self.w_h = torch.nn.Linear(in_channels, out_channels)
-        self.w_l = torch.nn.Linear(in_channels, out_channels)
-        self.beta = torch.nn.Parameter(torch.tensor(0.5))
 
-    def forward(self, x, edge_index):
-        # 1. Non-linear transformation
-        h_i = F.relu(self.w_h(x))
-        
-        # 2. Directed Convolution
-        conv_out = self.conv(x, edge_index)
-        
-        # 3. Intermediate representation with linear skip connection
-        x_prime = conv_out + self.w_l(x)
-        
-        # 4. Polynomial gating 
-        out = (1 - self.beta) * (h_i * x_prime) + self.beta * x_prime
+        self.dropout = dropout
+        self.lin_in = nn.Linear(in_channels, hidden_channels)
+
+        self.convs = nn.ModuleList([
+            DirectedFAGCNConv(
+                channels=hidden_channels,
+                eps=eps,
+                dropout=dropout,
+                share_gates=share_gates,
+            )
+            for _ in range(num_layers)
+        ])
+
+        self.lin_out = nn.Linear(hidden_channels, out_channels)
+
+    def forward(self, x: Tensor, edge_index: Tensor, edge_weight: Optional[Tensor] = None, return_alpha: bool = False,):
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        h0 = F.relu(self.lin_in(x))
+        h = h0
+
+        alpha_list = []
+
+        for conv in self.convs:
+            if return_alpha:
+                h, alpha_dict = conv(
+                    h,
+                    edge_index,
+                    x_res=h0,
+                    edge_weight=edge_weight,
+                    return_alpha=True,
+                )
+                alpha_list.append(alpha_dict)
+            else:
+                h = conv(
+                    h,
+                    edge_index,
+                    x_res=h0,
+                    edge_weight=edge_weight,
+                    return_alpha=False,
+                )
+
+            h = F.relu(h)
+            h = F.dropout(h, p=self.dropout, training=self.training)
+
+        out = self.lin_out(h)
+
+        if return_alpha:
+            return out, alpha_list
         return out
 
 
+##########
+
+
 class VariationalGraphEncoder(torch.nn.Module):
-    ''' Adapted Dir-Poly encoder class
-    '''
-    def __init__(self, in_channels, out_channels, dropout_rate=0.2):
+    ''' encoder class adapted for DirGNN + FAGCN '''
+    def __init__(self, in_channels, out_channels, dropout_rate = 0.2):
         super().__init__()
         self.out_channels = out_channels
         self.dropout_rate = dropout_rate
 
-        # Helper function to generate the Dir-GNN + GATv2 combo cleanly
-        def make_dir_poly_conv(in_dim, out_dim):
-            base_conv = GATv2Conv(in_dim, out_dim, heads=1, concat=False)
-            dir_conv = DirGNNConv(base_conv, alpha=0.5)
-            return PolyLayer(in_dim, out_dim, dir_conv)
-
-        # Layer 1: in_channels -> out_channels
-        self.conv1 = make_dir_poly_conv(in_channels, out_channels)
-        self.ln1 = LayerNorm(out_channels)
+        # Linear projections to replace ChebConv's dimensionality changes
+        self.proj_in = torch.nn.Linear(in_channels, 2*out_channels)
         
-        # Layer 2: out_channels -> 2*out_channels
-        self.conv2 = make_dir_poly_conv(out_channels, 2 * out_channels)
+        self.proj_mu = torch.nn.Linear(2 * out_channels, out_channels)
+        self.proj_logstd = torch.nn.Linear(2 * out_channels, out_channels)
+
+        # FAGCN Convolutions (dimensions remain constant during message passing)
+        self.conv1 = DirectedFAGCNConv(2 * out_channels)
+        self.ln1 = LayerNorm(2 * out_channels)
+        
+        self.conv2 = DirectedFAGCNConv(2 * out_channels)
         self.ln2 = LayerNorm(2 * out_channels)
         
-        # Mu and LogStd: 2*out_channels -> out_channels
-        self.conv_mu = make_dir_poly_conv(2 * out_channels, out_channels)
-        self.conv_logstd = make_dir_poly_conv(2 * out_channels, out_channels)
+        self.conv_mu = DirectedFAGCNConv(2 * out_channels)
+        self.conv_logstd = DirectedFAGCNConv(2 * out_channels)
 
     def forward(self, x, edge_index):
-        # Layer 1
-        x = self.conv1(x, edge_index)
-        x = self.ln1(x)
-        x = F.gelu(x)
 
-        # Layer 2
-        x = F.dropout(x, p=self.dropout_rate, training=self.training)
-        x = self.conv2(x, edge_index)
-        x = self.ln2(x)
-        x = F.gelu(x) 
+        # Project inputs to establish the base features (x_0) for this layer
+        h_0 = self.proj_in(x) 
+        h_0 = F.gelu(h_0)
+
+        x_1 = self.conv1(h_0, edge_index, x_res=h_0) 
+        x_1 = self.ln1(x_1)
+        x_1 = F.gelu(x_1)
+
+        x_2 = F.dropout(x_1, p=self.dropout_rate, training=self.training)
+        x_2 = self.conv2(x_2, edge_index, x_res=h_0)
+        x_2 = self.ln2(x_2)
+        x_2 = F.gelu(x_2) 
         
-        # Latent Space (Mu and LogStd)
-        x = F.dropout(x, p=self.dropout_rate, training=self.training)
-        mu = self.conv_mu(x, edge_index)
-        logst = self.conv_logstd(x, edge_index)
+        x_drop = F.dropout(x_2, p=self.dropout_rate, training=self.training)
+        
+        # Calculate mu and logstd
+        mu = self.conv_mu(x_drop, edge_index, x_res=h_0)
+        mu = self.proj_mu(mu)  # Final projection to out_channels
+        
+        logst = self.conv_logstd(x_drop, edge_index, x_res=h_0)
+        logst = self.proj_logstd(logst) # Final projection to out_channels
         
         return mu, logst
 
@@ -109,42 +314,42 @@ class MLP(torch.nn.Module):
         return self.network(x)
 
 class FeatureDecoder(torch.nn.Module):
-    ''' 
-    Adapted Feature decoder using Dir-Poly
-    '''
+    ''' Feature decoder adapted for DirGNN + FAGCN '''
     def __init__(self, n_channels, num_node_features, dropout_rate=0.1):
         super().__init__()
         self.dropout_rate = dropout_rate
         
-        # Helper to build the Dir-Poly SAGE block
-        def make_dir_poly_sage(channels):
-            base_conv = GATv2Conv(channels, channels, heads=1, concat=False)
-            dir_conv = DirGNNConv(base_conv, alpha=0.5)
-            return PolyLayer(channels, channels, dir_conv)
-
-        # Layer 1
-        self.conv1 = make_dir_poly_sage(n_channels)
+        # FAGCN convolutions
+        self.conv1 = DirectedFAGCNConv(n_channels, alpha=0.7)
         self.ln1 = LayerNorm(n_channels)
         
-        # Layer 2
-        self.conv2 = make_dir_poly_sage(n_channels)
+        self.conv2 = DirectedFAGCNConv(n_channels, alpha=0.7)
         self.ln2 = LayerNorm(n_channels)
         
+        # self.conv3 = DirectedFAGCNConv(n_channels)
+        # self.ln3 = LayerNorm(n_channels)
+
         self.last_layer = torch.nn.Linear(n_channels, num_node_features) 
 
     def forward(self, z, edge_index):
-        # Layer 1 (Notice: No explicit + z skip connection needed)
-        h1 = self.conv1(z, edge_index)
+        # In the decoder, the latent representation 'z' acts as the raw feature (x_0)
+        x_0 = z 
+
+        h1 = self.conv1(z, edge_index, x_res=x_0)
         h1 = self.ln1(h1)
-        h1_out = F.gelu(h1) 
+        h1_out = F.gelu(h1)
 
-        # Layer 2 (Notice: No explicit + h1_out skip connection needed)
         h1_drop = F.dropout(h1_out, p=self.dropout_rate, training=self.training)
-        h2 = self.conv2(h1_drop, edge_index)
+        h2 = self.conv2(h1_drop, edge_index, x_res=x_0)
         h2 = self.ln2(h2)
-        h2_out = F.gelu(h2) 
+        h2_out = F.gelu(h2)
 
-        # Final projection to reconstruct node features
+        # h2_drop = F.dropout(h2_out, p=self.dropout_rate, training=self.training)
+        # h3 = self.conv3(h2_drop, edge_index, x_res=x_0)
+        # h3 = self.ln3(h3)
+        # h3_out = F.gelu(h3)
+
+        # Output Head
         out = self.last_layer(h2_out) 
         
         # LeakyReLU during training to prevent dead gradients, hard ReLU for biological realism at eval

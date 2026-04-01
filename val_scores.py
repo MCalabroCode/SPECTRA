@@ -326,7 +326,7 @@ def calc_auprc(adata_true, adata_pred, pert_col='target_gene', control_name='non
     print(f"Average Baseline AUPRC: {sum(baseline_results.values())/len(baseline_results):.4f}")
     print(f"Average Model AUPRC:    {sum(model_results.values())/len(model_results):.4f}")
     
-    return model_results, baseline_results
+    return model_results
 
 ########################################################
 ################## BENCHMARK METRICS ###################
