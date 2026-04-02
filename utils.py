@@ -31,7 +31,7 @@ def data_preprocessing(adata, condition_col, control_tag, min_genes=200, min_cel
     sc.pp.filter_cells(adata, min_genes=min_genes)
     sc.pp.filter_genes(adata, min_cells=min_cells) # TODO: should be 3 but if so I would have to recalculate the GRN....
     if logtransform:
-        adata.raw = adata.copy() 
+        #adata.raw = adata.copy() 
         sc.pp.normalize_total(adata, target_sum = 1e4)
         sc.pp.log1p(adata)
 
@@ -97,19 +97,28 @@ class PerturbationDataset(Dataset):
         self.start_idx = start_idx
         self.end_idx = end_idx if end_idx is not None else len(adata)
 
-        adata = adata[self.start_idx:self.end_idx].copy()
+        adata = adata[self.start_idx:self.end_idx]
         self.adata = adata
 
         # perturbed samples
-        ptb_adata = adata[adata.obs['target_gene']!='non-targeting'].copy()
-        ptb_samples = ptb_adata.X.toarray() if hasattr(ptb_adata.X, 'toarray') else np.asarray(ptb_adata.X)
-        self.ptb_samples = torch.tensor(ptb_samples, dtype=torch.float) #NOTE: local to this split
-        self.ptb_names = ptb_adata.obs['target_gene'].values #NOTE: local to this split
+        # ptb_adata = adata[adata.obs['target_gene']!='non-targeting'].copy()
+        # ptb_samples = ptb_adata.X.toarray() if hasattr(ptb_adata.X, 'toarray') else np.asarray(ptb_adata.X)
+        # self.ptb_samples = torch.tensor(ptb_samples, dtype=torch.float) #NOTE: local to this split
+        # self.ptb_names = ptb_adata.obs['target_gene'].values #NOTE: local to this split
 
-        # control samples
-        self.ctrl_samples = adata[adata.obs['target_gene']=='non-targeting'].X.copy()
-        self.ctrl_samples = self.ctrl_samples.toarray() if hasattr(self.ctrl_samples, 'toarray') else np.asarray(self.ctrl_samples)
-        self.ctrl_samples = torch.tensor(self.ctrl_samples, dtype=torch.float)
+        # # control samples
+        # self.ctrl_samples = adata[adata.obs['target_gene']=='non-targeting'].X.copy()
+        # self.ctrl_samples = self.ctrl_samples.toarray() if hasattr(self.ctrl_samples, 'toarray') else np.asarray(self.ctrl_samples)
+        # self.ctrl_samples = torch.tensor(self.ctrl_samples, dtype=torch.float)
+
+        # NEW: optimized for sparse format
+        ptb_adata = adata[adata.obs['target_gene'] != 'non-targeting']
+        ctrl_adata = adata[adata.obs['target_gene'] == 'non-targeting']
+        self.ptb_samples = ptb_adata.X.tocsr() if sparse.issparse(ptb_adata.X) else sparse.csr_matrix(ptb_adata.X)
+        self.ptb_names = ptb_adata.obs['target_gene'].values 
+        self.ctrl_samples = ctrl_adata.X.tocsr() if sparse.issparse(ctrl_adata.X) else sparse.csr_matrix(ctrl_adata.X)
+        if self.ctrl_samples.shape[0] == 0:
+            raise ValueError("No control cells found in this dataset split!")
 
     def _pert_embedding(self, pert_name):
         embedding = torch.zeros(self.adata.shape[1], dtype=torch.bool)
@@ -120,10 +129,16 @@ class PerturbationDataset(Dataset):
 
     def __getitem__(self, idx):
 
-        #x = self.rand_ctrl_samples[idx].view(-1,1)
         j = np.random.randint(0, self.ctrl_samples.shape[0]) #random control cell
-        x = self.ctrl_samples[j].view(-1,1)
-        y = self.ptb_samples[idx].view(-1,1)
+        
+        # x = self.ctrl_samples[j].view(-1,1)
+        # y = self.ptb_samples[idx].view(-1,1)
+
+        # NEW FIX: Convert ONLY these two specific cells to dense arrays on the fly
+        x_dense = self.ctrl_samples[j].toarray().squeeze()
+        y_dense = self.ptb_samples[idx].toarray().squeeze()
+        x = torch.tensor(x_dense, dtype=torch.float).view(-1, 1)
+        y = torch.tensor(y_dense, dtype=torch.float).view(-1, 1)
         pert = self._pert_embedding(self.ptb_names[idx])
 
         return x,y,pert

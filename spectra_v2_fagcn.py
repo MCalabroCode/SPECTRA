@@ -320,10 +320,10 @@ class FeatureDecoder(torch.nn.Module):
         self.dropout_rate = dropout_rate
         
         # FAGCN convolutions
-        self.conv1 = DirectedFAGCNConv(n_channels, alpha=0.7)
+        self.conv1 = DirectedFAGCNConv(n_channels, alpha=0.6)
         self.ln1 = LayerNorm(n_channels)
         
-        self.conv2 = DirectedFAGCNConv(n_channels, alpha=0.7)
+        self.conv2 = DirectedFAGCNConv(n_channels, alpha=0.6)
         self.ln2 = LayerNorm(n_channels)
         
         # self.conv3 = DirectedFAGCNConv(n_channels)
@@ -768,7 +768,7 @@ def train_step_perturb_model(model, data, device, alpha=1., beta=1., mmd_gamma=0
     else:
         loss_mmd_x = 0.0
 
-    total_loss = control_loss + loss_mmd_y + mmd_gamma * loss_mmd_x + 0.1 * loss_cosine
+    total_loss = control_loss + loss_mmd_y + mmd_gamma * loss_mmd_x + loss_cosine
 
     return total_loss, loss_mmd_y, loss_mmd_x, kl_div, loss_cosine, loss_feat
 
