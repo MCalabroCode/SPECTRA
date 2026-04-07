@@ -13,6 +13,10 @@ from torch.nn import ReLU, LeakyReLU, GELU, LayerNorm
 
 import wandb
 
+import anndata as ad
+from val_scores import calc_auprc
+import pandas as pd
+
 from torch import Tensor
 
 from torch_geometric.nn import MessagePassing
@@ -179,66 +183,6 @@ class DirectedFAGCNConv(MessagePassing):
         alpha = torch.tanh(gate_nn(torch.cat([x_center, x_neigh], dim=-1))).view(-1)
         return alpha
 
-
-class DirectedFAGCN(nn.Module):
-    def __init__(self, in_channels: int, hidden_channels: int, out_channels: int, num_layers: int = 2, 
-        eps: float = 0.2,
-        dropout: float = 0.5,
-        share_gates: bool = False,
-    ):
-        super().__init__()
-
-        self.dropout = dropout
-        self.lin_in = nn.Linear(in_channels, hidden_channels)
-
-        self.convs = nn.ModuleList([
-            DirectedFAGCNConv(
-                channels=hidden_channels,
-                eps=eps,
-                dropout=dropout,
-                share_gates=share_gates,
-            )
-            for _ in range(num_layers)
-        ])
-
-        self.lin_out = nn.Linear(hidden_channels, out_channels)
-
-    def forward(self, x: Tensor, edge_index: Tensor, edge_weight: Optional[Tensor] = None, return_alpha: bool = False,):
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        h0 = F.relu(self.lin_in(x))
-        h = h0
-
-        alpha_list = []
-
-        for conv in self.convs:
-            if return_alpha:
-                h, alpha_dict = conv(
-                    h,
-                    edge_index,
-                    x_res=h0,
-                    edge_weight=edge_weight,
-                    return_alpha=True,
-                )
-                alpha_list.append(alpha_dict)
-            else:
-                h = conv(
-                    h,
-                    edge_index,
-                    x_res=h0,
-                    edge_weight=edge_weight,
-                    return_alpha=False,
-                )
-
-            h = F.relu(h)
-            h = F.dropout(h, p=self.dropout, training=self.training)
-
-        out = self.lin_out(h)
-
-        if return_alpha:
-            return out, alpha_list
-        return out
-
-
 ##########
 
 
@@ -250,26 +194,27 @@ class VariationalGraphEncoder(torch.nn.Module):
         self.dropout_rate = dropout_rate
 
         # Linear projections to replace ChebConv's dimensionality changes
-        self.proj_in = torch.nn.Linear(in_channels, 2*out_channels)
+        # self.proj_in = torch.nn.Linear(in_channels, 2*out_channels)
         
-        self.proj_mu = torch.nn.Linear(2 * out_channels, out_channels)
-        self.proj_logstd = torch.nn.Linear(2 * out_channels, out_channels)
+        self.proj_mu = torch.nn.Linear(out_channels, out_channels)
+        self.proj_logstd = torch.nn.Linear(out_channels, out_channels)
 
         # FAGCN Convolutions (dimensions remain constant during message passing)
-        self.conv1 = DirectedFAGCNConv(2 * out_channels)
-        self.ln1 = LayerNorm(2 * out_channels)
+        self.conv1 = DirectedFAGCNConv(out_channels)
+        self.ln1 = LayerNorm(out_channels)
         
-        self.conv2 = DirectedFAGCNConv(2 * out_channels)
-        self.ln2 = LayerNorm(2 * out_channels)
+        self.conv2 = DirectedFAGCNConv(out_channels)
+        self.ln2 = LayerNorm(out_channels)
         
-        self.conv_mu = DirectedFAGCNConv(2 * out_channels)
-        self.conv_logstd = DirectedFAGCNConv(2 * out_channels)
+        self.conv_mu = DirectedFAGCNConv(out_channels)
+        self.conv_logstd = DirectedFAGCNConv(out_channels)
 
     def forward(self, x, edge_index):
 
         # Project inputs to establish the base features (x_0) for this layer
-        h_0 = self.proj_in(x) 
-        h_0 = F.gelu(h_0)
+        # h_0 = self.proj_in(x) 
+        # h_0 = F.gelu(h_0)
+        h_0 = x
 
         x_1 = self.conv1(h_0, edge_index, x_res=h_0) 
         x_1 = self.ln1(x_1)
@@ -320,10 +265,10 @@ class FeatureDecoder(torch.nn.Module):
         self.dropout_rate = dropout_rate
         
         # FAGCN convolutions
-        self.conv1 = DirectedFAGCNConv(n_channels, alpha=0.6)
+        self.conv1 = DirectedFAGCNConv(n_channels, alpha=0.7)
         self.ln1 = LayerNorm(n_channels)
         
-        self.conv2 = DirectedFAGCNConv(n_channels, alpha=0.6)
+        self.conv2 = DirectedFAGCNConv(n_channels, alpha=0.7)
         self.ln2 = LayerNorm(n_channels)
         
         # self.conv3 = DirectedFAGCNConv(n_channels)
@@ -368,6 +313,7 @@ class PerturbModel(torch.nn.Module):
         self.device = device 
 
         self.num_nodes = num_nodes 
+        self.config = config
         self.n_channels = config['n_channels']
         self.dropout_p = config['dropout_p']
         self.architecture_name = config['architecture']
@@ -410,7 +356,7 @@ class PerturbModel(torch.nn.Module):
         self.ko_mu = torch.nn.Embedding(num_nodes, 64)
         self.ko_mlp = MLP([64, self.n_channels, self.n_channels])
 
-        self.encoder = VariationalGraphEncoder(self.n_channels, self.n_channels, self.dropout_p) #OR self.num_node_features
+        self.encoder = VariationalGraphEncoder(self.n_channels, self.n_channels, self.dropout_p)
         self.gex_decoder = FeatureDecoder(self.n_channels, 1, self.dropout_p)
         
         self._cached_batch_size = 0
@@ -436,7 +382,6 @@ class PerturbModel(torch.nn.Module):
         self._cached_edge_index = edge_index_batch
         return edge_index_batch
 
-    
     def _get_batched_gene_ids(self, batch_size):
         '''
         repeats the genes ids exactly batch_size times (e.g. [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3])
@@ -475,16 +420,18 @@ class PerturbModel(torch.nn.Module):
         batch_size, num_nodes, num_features = x.shape
 
         edge_index_batch = self._get_batched_edge_index(batch_size)
-        #x = x.reshape(batch_size * num_nodes, num_features) #[BxN,1]
+        #x = x.reshape(batch_size * num_nodes, num_features) #[BxN,1] 
         pert = pert.reshape(batch_size * num_nodes) #[BxN]
 
         # --- NEW PROJECT & ADD LOGIC ---
         gene_ids = self._get_batched_gene_ids(batch_size) 
         scgpt_base = self.gene_embeddings(gene_ids) 
         x_flat = x.reshape(batch_size * num_nodes, 1) 
+
         expr_proj = self.project_expr(x_flat)       # [B * N, n_channels]
         gene_proj = self.project_gene(scgpt_base)   # [B * N, n_channels]
         h_node = expr_proj + gene_proj
+
         h_node = self.add_norm(h_node)              # [B * N, n_channels]
         h_node = F.gelu(h_node)                     # Give it a non-linearity
 
@@ -792,8 +739,69 @@ def test_perturb_model(model, loader, device):
     avg_pert_mmd = sum(pert_mmd)/len(pert_mmd)
     return avg_pert_mmd
 
+@torch.no_grad()
+def test_perturb_model_new(model, loader, device, var_names, idx_to_gene):
+    model.eval()
+    
+    pred_expr_list = []
+    true_expr_list = []
+    control_expr_list = []
+    obs_gene_list = []
+    
+    # 1. Accumulate all predictions and ground truths
+    for i, data in enumerate(tqdm(loader, desc='testing with AUPRC...')):
+        x, y, pert = data
+        x, y, pert = x.to(device), y.to(device), pert.to(device)
 
-def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support, live_plot):
+        B = pert.shape[0]
+        N = pert.shape[1]
+
+        y_hat, _ = model((x, pert)) 
+
+        # Store arrays (moving them off GPU immediately to save VRAM)
+        pred_expr_list.append(y_hat.view(B, N).cpu().numpy())
+        true_expr_list.append(y.view(B, N).cpu().numpy())
+        
+        # We must also save the input 'x' cells. calc_auprc needs control 
+        control_expr_list.append(x.view(B, N).cpu().numpy())
+
+        # Decode the boolean perturbation tensor back to strings
+        for b in range(B):
+            pert_indices = torch.where(pert[b])[0]
+            if len(pert_indices) == 0:
+                obs_gene_list.append('non-targeting')
+            else:
+                # Reconstruct combinatorial names if needed (e.g., 'A+B')
+                pert_name = "+".join([idx_to_gene[idx.item()] for idx in pert_indices])
+                obs_gene_list.append(pert_name)
+
+    # 2. Stack everything into dense numpy matrices
+    X_pred = np.vstack(pred_expr_list)
+    X_true = np.vstack(true_expr_list)
+    X_ctrl = np.vstack(control_expr_list)
+
+    # 3. Build DataFrames for AnnData construction
+    obs_pert = pd.DataFrame({"target_gene": obs_gene_list})
+    obs_ctrl = pd.DataFrame({"target_gene": ['non-targeting'] * X_ctrl.shape[0]})
+    var = pd.DataFrame(index=var_names)
+
+    # 4. Construct the AnnData objects
+    adata_pred = ad.AnnData(X=X_pred, obs=obs_pert.copy(), var=var)
+    adata_true = ad.AnnData(X=X_true, obs=obs_pert.copy(), var=var)
+    adata_ctrl = ad.AnnData(X=X_ctrl, obs=obs_ctrl, var=var)
+
+    # Concat the control cells into both datasets so the metric can compute DEGs
+    adata_pred_full = ad.concat([adata_pred, adata_ctrl])
+    adata_true_full = ad.concat([adata_true, adata_ctrl])
+
+    # 5. Calculate the final dataset-wide metric!
+    # (Assuming calc_auprc returns a single float score)
+    auprc_score = calc_auprc(adata_true_full, adata_pred_full, pert_col='target_gene', control_name='non-targeting')
+    average = sum(auprc_score.values()) / len(auprc_score)
+
+    return average
+
+def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support, live_plot, var_names, idx_to_gene):
 
     global_loss = []
     mmd_pert = []
@@ -804,13 +812,19 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
     batch_size = first_batch[0].shape[0]
 
     accumulation_steps = 1
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, fused=True, weight_decay=0.0001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, fused=True, weight_decay=0.001)
 
     weights_dir = 'weights'
     os.makedirs(weights_dir, exist_ok=True)
 
     # wandb watch
     if wandb_support:
+        # Initialize wandb run
+        wandb.init(
+            project="spectra-v2",       # The name of your project in wandb
+            name=f"{model.config['architecture']}",   # (Optional) Name of this specific run
+            config=model.config               # Pass your dictionary here!
+        )
         wandb.watch(model, log="all", log_freq=10) # log="all" tracks both gradients and parameters
 
     for epoch in range(1, n_epochs + 1):
@@ -869,7 +883,7 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
         
         # validation
         if epoch!=0:
-            avg_feat_err = test_perturb_model(model, test_loader, model.device)
+            avg_feat_err = test_perturb_model_new(model, test_loader, model.device, var_names, idx_to_gene)
             test_wmse.append(avg_feat_err)
 
             # routine for plotting traning/testing metrics during the training

@@ -13,6 +13,7 @@
 /weights
 /results
 /wandb
+/benchmark_figures
 /echoes
 /scgpt
 *.pth

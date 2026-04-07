@@ -6,7 +6,7 @@ from matplotlib.ticker import MaxNLocator
 import os
 import torch
 import torch.nn.functional as F
-from torch_geometric.nn import ChebConv, DirGNNConv, MixHopConv, GATv2Conv
+from torch_geometric.nn import ChebConv, DirGNNConv, GATv2Conv
 from torch_geometric.utils import dropout_edge
 from torch.nn import ReLU, LeakyReLU, GELU, LayerNorm
 from magnet import MagNetConv, precompute_magnet_attributes_sparse
@@ -823,6 +823,12 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
 
     # wandb watch
     if wandb_support:
+        # Initialize wandb run
+        wandb.init(
+            project="spectra-v2",       # The name of your project in wandb
+            name=f"{config['architecture']}",   # (Optional) Name of this specific run
+            config=config               # Pass your dictionary here!
+        )
         wandb.watch(model, log="all", log_freq=10) # log="all" tracks both gradients and parameters
 
     for epoch in range(1, n_epochs + 1):
