@@ -13,10 +13,12 @@ from torch.utils.data import Dataset, DataLoader
 import random
 import os
 import wandb
+import pickle
+
 
 from WMSE import compute_weights
-from spectra_v2_poly import PerturbModel
-from spectra_v2_poly import train
+from spectra_v2_fagcn import PerturbModel
+from spectra_v2_fagcn import train
 from utils import data_preprocessing
 
 
@@ -36,12 +38,10 @@ print(device)
 adata = sc.read_h5ad('../data/vcc_data/adata_Training.h5ad') #VCC
 adata = data_preprocessing(adata, 'target_gene', 'non-targeting')
 
-import pickle
-
 with open("scGPT_embeddings_all_genes.pkl", "rb") as f:
     scgpt_dict = pickle.load(f)
 
-# patrick guanlab (stock)
+# network load
 A = np.load('Patrick_networks/guanlab_stock_3.5k_directed.npz') #guanlab_stock_3.5k_directed.npz
 adjacency = A['adjacency']
 gene_names = A['gene_names']
@@ -57,11 +57,7 @@ G = nx.from_numpy_array(
 # Relabel nodes with gene names (must be same length as matrix dims)
 mapping = {i: gene_names[i] for i in range(len(gene_names))}
 G = nx.relabel_nodes(G, mapping)
-
 G.remove_nodes_from([n for n in G.nodes if n not in scgpt_dict])
-G.remove_edges_from([(u, v) for u, v, d in G.edges(data=True) if np.log(d['weight']+1) < 10])
-
-
 num_nodes = G.number_of_nodes()
 num_edges = G.number_of_edges()
 num_features = 1
@@ -72,7 +68,7 @@ print("Number of node features per node:", num_features)
 # filter adata
 gene_list = list(G.nodes())
 mask = adata.var_names.isin(gene_list)
-adata = adata[:, mask].copy()
+adata = adata[:, mask]
 
 # check if the node names of the networkx graph aorresponds to adata.var_names
 assert set(G.nodes) == set(adata.var_names), "Nodes in G and adata.var_names differ!"
@@ -94,7 +90,7 @@ config = dict(
     lr=0.001,
     n_epochs=20,
     dataset="VCC",
-    architecture="Poly-Dir_scGPT_dumb_correct_cellwise")
+    architecture="FAGCN_smallbatches")
 
 # map genes to gene names for scGPT
 scgpt_dict = {gene_to_idx[k]: v for k, v in scgpt_dict.items() if k in gene_to_idx}
@@ -105,12 +101,6 @@ embedding_matrix = torch.zeros((num_nodes, scgpt_dim))
 for gene_id, emb in scgpt_dict.items():
     embedding_matrix[gene_id] = torch.tensor(emb, dtype=torch.float32)
 
-# Initialize wandb run
-wandb.init(
-    project="spectra-v2",       # The name of your project in wandb
-    name=f"{config['architecture']}",   # (Optional) Name of this specific run
-    config=config               # Pass your dictionary here!
-)
 
 ######## dataloaders preparation
 
@@ -137,6 +127,7 @@ model = model.to(device)
 print(model)
 
 ########## training
+idx_to_gene = {v: k for k, v in gene_to_idx.items()}
 _, _, test_wmse = train(model=model, 
     train_loader=train_loader, 
     test_loader=val_loader,
@@ -144,7 +135,9 @@ _, _, test_wmse = train(model=model,
     n_epochs=config['n_epochs'],  
     device=device,
     wandb_support=True,
-    live_plot=False)
+    var_names = adata.var_names.tolist(),
+    idx_to_gene = idx_to_gene
+)
 
 
 ######### save and close

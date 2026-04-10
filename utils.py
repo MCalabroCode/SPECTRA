@@ -21,7 +21,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.sampler import Sampler
 import random
 
-def data_preprocessing(adata, condition_col, control_tag, min_genes=200, min_cells=3, min_cells_per_sample=100, logtransform=True):
+def data_preprocessing(adata, condition_col, control_tag, min_genes=200, min_cells=3, min_cells_per_pert=100, logtransform=True):
 
     # Rename column and ctrl samples
     adata.obs = adata.obs.rename(columns={condition_col: "target_gene"})
@@ -35,9 +35,9 @@ def data_preprocessing(adata, condition_col, control_tag, min_genes=200, min_cel
         sc.pp.normalize_total(adata, target_sum = 1e4)
         sc.pp.log1p(adata)
 
-    # select only perturbations that are present in at least min_cells_per_sample cells
+    # select only perturbations that are present in at least min_cells_per_pert cells
     counts = adata.obs['target_gene'].value_counts()
-    valid_pert = counts[counts >= min_cells_per_sample].index
+    valid_pert = counts[counts >= min_cells_per_pert].index
     adata = adata[adata.obs['target_gene'].isin(valid_pert)]
     return adata
 

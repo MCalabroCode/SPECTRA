@@ -24,7 +24,45 @@ from torch_geometric.utils import degree
 import torch.nn as nn
 from typing import Optional, Tuple, Dict, Any
 
+import random
+torch.manual_seed(42)
+np.random.seed(42)
+random.seed(42)
 
+
+class GeneExpressionFiLM(nn.Module):
+    def __init__(self, emb_dim, shift_scale=0.05):
+        super().__init__()
+        self.scale = nn.Linear(1, emb_dim)
+        self.shift = nn.Linear(1, emb_dim)
+        self.shift_scale = shift_scale
+        
+        # CRITICAL: Zero-initialize so the layer starts as a pure Identity mapping
+        nn.init.zeros_(self.scale.weight)
+        nn.init.zeros_(self.scale.bias)
+        nn.init.zeros_(self.shift.weight)
+        nn.init.zeros_(self.shift.bias)
+
+    def forward(self, gene_emb, expr):
+
+        # gene_emb: [B*N, D]
+        # expr: [B*N, 1]
+
+        # Softplus allows gamma to grow naturally > 1 without saturating, 
+        # but prevents it from ever going negative (which would flip the embedding vector)
+        # Because scale is 0-initialized, Softplus(0) = 0.69. 
+        # We shift it so gamma starts at exactly 1.0.
+        
+        gamma = self.scale(expr) 
+        # If you want to bound it strictly to [0, 2]:
+        #gamma = 1.0 + torch.tanh(gamma) 
+        
+        # Or, if you want an unbounded, strictly positive scale (Highly Recommended):
+        gamma = 1.0 + F.elu(gamma) # Starts at 1.0, can't go below 0, can grow infinitely
+        
+        beta = self.shift_scale * self.shift(expr)
+
+        return gamma * gene_emb + beta
 
 class DirectedFAGCNConv(MessagePassing):
     """
@@ -337,6 +375,7 @@ class PerturbModel(torch.nn.Module):
 
         self.project_gene = torch.nn.Linear(scgpt_dim, self.n_channels)
         self.project_expr = torch.nn.Linear(1, self.n_channels)
+        self.film_layer = GeneExpressionFiLM(self.n_channels, shift_scale=0.05)
 
         # Optional: A LayerNorm to stabilize the addition
         self.add_norm = LayerNorm(self.n_channels)
@@ -428,14 +467,14 @@ class PerturbModel(torch.nn.Module):
         scgpt_base = self.gene_embeddings(gene_ids) 
         x_flat = x.reshape(batch_size * num_nodes, 1) 
 
-        expr_proj = self.project_expr(x_flat)       # [B * N, n_channels]
+        #expr_proj = self.project_expr(x_flat)       # [B * N, n_channels]
         gene_proj = self.project_gene(scgpt_base)   # [B * N, n_channels]
-        h_node = expr_proj + gene_proj
+        x_node_features = self.film_layer(gene_proj, x_flat)
+        #h_node = expr_proj + gene_proj
+        #h_node = self.add_norm(h_node)              # [B * N, n_channels]
+        #h_node = F.gelu(h_node)                     # Give it a non-linearity
 
-        h_node = self.add_norm(h_node)              # [B * N, n_channels]
-        h_node = F.gelu(h_node)                     # Give it a non-linearity
-
-        mu, logstd = self.encoder(h_node, edge_index_batch) # both [BxN, C] (C = hidden channels dimension)
+        mu, logstd = self.encoder(x_node_features, edge_index_batch) # both [BxN, C] (C = hidden channels dimension)
         logstd = torch.clamp(logstd, min=-20, max=10) # this is to avoid inf values
 
         self.last_mu = mu          
@@ -801,8 +840,11 @@ def test_perturb_model_new(model, loader, device, var_names, idx_to_gene):
 
     return average
 
-def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support, live_plot, var_names, idx_to_gene):
-
+def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support, var_names, idx_to_gene, patience=5, metric_mode='min'):
+    """
+    metric_mode: Set to 'max' if your validation metric is AUPRC/Accuracy (higher is better). 
+                 Set to 'min' if your validation metric is MMD/MSE/Loss (lower is better).
+    """
     global_loss = []
     mmd_pert = []
     mmd_ctrl = []
@@ -817,11 +859,16 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
     weights_dir = 'weights'
     os.makedirs(weights_dir, exist_ok=True)
 
+    # Early Stopping Setup
+    best_val_metric = float('-inf') if metric_mode == 'max' else float('inf')
+    patience_counter = 0
+    best_filepath = os.path.join(weights_dir, f"best_model_weights_{model.architecture_name}.pth")
+
     # wandb watch
     if wandb_support:
         # Initialize wandb run
         wandb.init(
-            project="spectra-v2",       # The name of your project in wandb
+            project="SPECTRA",       # The name of your project in wandb
             name=f"{model.config['architecture']}",   # (Optional) Name of this specific run
             config=model.config               # Pass your dictionary here!
         )
@@ -878,60 +925,63 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
         print(f'training KL = {epoch_kl:.5f} | mse = {epoch_mse:.3f} | cos = {epoch_cos:.3f}')
 
         # save current epoch weights
-        filepath = os.path.join(weights_dir, f"weights_epoch_{epoch}__nodes-{model.num_nodes}_b-{batch_size}_h-{model.n_channels}_p-{model.dropout_p}__model-{model.architecture_name}.pth")
+        filepath = os.path.join(weights_dir, f"weights__model-{model.architecture_name}_epoch-{epoch}__nodes-{model.num_nodes}_b-{batch_size}_h-{model.n_channels}_p-{model.dropout_p}.pth")
         torch.save(model.state_dict(), filepath)
         
-        # validation
+        # Validation & Early Stopping
         if epoch!=0:
-            avg_feat_err = test_perturb_model_new(model, test_loader, model.device, var_names, idx_to_gene)
-            test_wmse.append(avg_feat_err)
 
-            # routine for plotting traning/testing metrics during the training
-            if live_plot:
-                epoch_axis = list(range(1, epoch + 1))
-                clear_output(wait=True) 
-                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 16))       
-                ax1.plot(epoch_axis, global_loss, linestyle= '-', label='Loss')
-                ax1.plot(epoch_axis, mmd_pert, label='Perturb cells MMD')
-                ax1.plot(epoch_axis, mmd_ctrl, label='Control cells MMD')
-                ax1.set_title('Training')
-                ax1.set_xlabel('Epoch')
-                ax1.xaxis.set_major_locator(MaxNLocator(integer=True))
-                ax1.set_xlim(1, n_epochs)
-                ax1.legend(frameon=False)
-                ax1.grid(True)
+            # We assume this returns your primary metric (MMD)
+            val_metric = test_perturb_model(model, test_loader, device)
+            test_wmse.append(val_metric)
 
-                ax2.plot(epoch_axis, test_wmse, linewidth=1.2, label='validation WMSE')
-                ax2.set_title('Validation')
-                ax2.set_xlabel('Epoch')
-                ax2.set_ylabel('MMD')
-                ax2.xaxis.set_major_locator(MaxNLocator(integer=True))
-                ax2.set_xlim(1, n_epochs)
-                ax2.legend(frameon=False)
-                ax2.grid(True)
+            # Check if this is the best model so far
+            is_best = (val_metric > best_val_metric) if metric_mode == 'max' else (val_metric < best_val_metric)
 
-                plt.tight_layout()
-                plt.savefig('plot_v2.png', dpi=300, bbox_inches='tight')
-                display(fig)   
-                plt.close(fig) 
+            if is_best:
+                print(f"Validation metric improved to {val_metric:.4f}. Saving best model...")
+                best_val_metric = val_metric
+                patience_counter = 0
+                torch.save(model.state_dict(), best_filepath)
+            else:
+                patience_counter += 1
+                print(f"No improvement. Patience: {patience_counter}/{patience}")
+
+            # W&B Logging
+            if wandb_support:
+                wandb.log({
+                    "epoch": epoch,
+                    "train/global_loss": epoch_loss,
+                    "train/mmd_pert": epoch_mmd_pert,
+                    "train/mmd_ctrl": epoch_mmd_ctrl,
+                    "train/kl_divergence": epoch_kl,
+                    "train/mse": epoch_mse,
+                    "train/cosine_loss": epoch_cos,
+                    "val/test_MMD": val_metric # Renamed slightly for clarity
+                })
+
+            # Trigger Early Stopping
+            if patience_counter >= patience:
+                print(f"Early stopping triggered! No improvement for {patience} epochs.")
+                break
         
-        # wandb support
-        if wandb_support:
-            log_metrics = {
-                "epoch": epoch,
-                "train/global_loss": epoch_loss,
-                "train/mmd_pert": epoch_mmd_pert,
-                "train/mmd_ctrl": epoch_mmd_ctrl,
-                "train/kl_divergence": epoch_kl,
-                "train/mse": epoch_mse,
-                "train/cosine_loss": epoch_cos,
-            }
+    # ==========================================
+    # FINAL EVALUATION PHASE
+    # ==========================================
+    print("\n--- Training concluded. Initiating Final Evaluation ---")
+    
+    # Reload the absolute best weights before running the final metric
+    if os.path.exists(best_filepath):
+        print("Reloading best epoch weights for final evaluation...")
+        model.load_state_dict(torch.load(best_filepath))
+    
+    # Calculate the metric strictly ONCE
+    final_metric_val = test_perturb_model_new(model, test_loader, model.device, var_names, idx_to_gene)
+    print(f"FINAL TEST METRIC: {final_metric_val:.4f}")
+    
+    if wandb_support:
+        wandb.log({"val/AUPRC": final_metric_val})
 
-            # Only log validation metric if it was calculated
-            if avg_feat_err is not None:
-                log_metrics["val/test_MMD"] = avg_feat_err
-                
-            wandb.log(log_metrics)
-
-
+    wandb.finish()
+    
     return mmd_pert, mmd_ctrl, test_wmse
