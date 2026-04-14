@@ -4,6 +4,7 @@ from IPython.display import clear_output, display
 from tqdm import tqdm
 from matplotlib.ticker import MaxNLocator
 import os
+import uuid
 import torch
 import torch.nn.functional as F
 from torch_geometric.nn import FAConv, DirGNNConv, GATv2Conv
@@ -24,10 +25,10 @@ from torch_geometric.utils import degree
 import torch.nn as nn
 from typing import Optional, Tuple, Dict, Any
 
-import random
-torch.manual_seed(42)
-np.random.seed(42)
-random.seed(42)
+# import random
+# torch.manual_seed(42)
+# np.random.seed(42)
+# random.seed(42)
 
 
 class GeneExpressionFiLM(nn.Module):
@@ -355,7 +356,7 @@ class PerturbModel(torch.nn.Module):
         self.n_channels = config['n_channels']
         self.dropout_p = config['dropout_p']
         self.architecture_name = config['architecture']
-        self.num_node_features = config['num_node_features'] 
+        #self.num_node_features = config['num_node_features'] 
         
         self.register_buffer('edge_index', edge_index)
         #self.edge_dropout_p = edge_dropout_p
@@ -762,7 +763,8 @@ def train_step_perturb_model(model, data, device, alpha=1., beta=1., mmd_gamma=0
 def test_perturb_model(model, loader, device):
     model.eval()
     pert_mmd = []
-    for i, data in enumerate(tqdm(loader, desc='testing with MMD...')):
+    pert_wmse = []
+    for i, data in enumerate(tqdm(loader, desc='testing...')):
         x, y, pert = data
         x, y, pert = x.to(device), y.to(device), pert.to(device)
 
@@ -772,11 +774,35 @@ def test_perturb_model(model, loader, device):
         y_hat, _ = model((x,pert)) #[B*N,1]
         y_flat = y.reshape(-1, 1) #[B*N,1]
 
+        # weights
+        is_control = pert.sum(dim=1) == 0
+        pert_indices = pert.int().argmax(dim=1)
+        weight_lookup_indices = torch.where(
+            is_control, 
+            torch.tensor(model.num_nodes, device=device), 
+            pert_indices
+        )
+        specific_weights = model.weight_lookup[weight_lookup_indices] #shape: [B, N]
+
+        squared_error = (y_hat - y_flat)**2 # Shape: [B*N, 1]
+        
+        # Reshape to [B, N] to match weights
+        squared_error_batch = squared_error.reshape(B, N)
+        weights_batch = specific_weights.reshape(B, N)
+        
+        # Calculate Weighted MSE
+        loss_per_cell = torch.sum(squared_error_batch * weights_batch, dim=1)
+        error = torch.mean(loss_per_cell)
+        pert_wmse.append(error.item())
+
+        # mmd
         mmd_error = compute_mmd(y_flat.view(B,N), y_hat.view(B,N))
+
         pert_mmd.append(mmd_error.item())
 
     avg_pert_mmd = sum(pert_mmd)/len(pert_mmd)
-    return avg_pert_mmd
+    avg_pert_wmse = sum(pert_wmse)/len(pert_wmse)
+    return avg_pert_mmd, avg_pert_wmse
 
 @torch.no_grad()
 def test_perturb_model_new(model, loader, device, var_names, idx_to_gene):
@@ -840,7 +866,7 @@ def test_perturb_model_new(model, loader, device, var_names, idx_to_gene):
 
     return average
 
-def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support, var_names, idx_to_gene, patience=5, metric_mode='min'):
+def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support, var_names, idx_to_gene, alpha_weight, beta_weight, patience=5, metric_mode='min'):
     """
     metric_mode: Set to 'max' if your validation metric is AUPRC/Accuracy (higher is better). 
                  Set to 'min' if your validation metric is MMD/MSE/Loss (lower is better).
@@ -848,8 +874,10 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
     global_loss = []
     mmd_pert = []
     mmd_ctrl = []
+
     test_wmse = []
-    
+    test_mmd = []
+
     first_batch = next(iter(train_loader))
     batch_size = first_batch[0].shape[0]
 
@@ -862,16 +890,20 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
     # Early Stopping Setup
     best_val_metric = float('-inf') if metric_mode == 'max' else float('inf')
     patience_counter = 0
-    best_filepath = os.path.join(weights_dir, f"best_model_weights_{model.architecture_name}.pth")
+
+    if wandb_support and wandb.run is not None:
+        best_filepath = f"best_model_{wandb.run.id}.pt"
+    else:
+        best_filepath = f"best_model_{uuid.uuid4().hex}.pt"
 
     # wandb watch
     if wandb_support:
         # Initialize wandb run
-        wandb.init(
-            project="SPECTRA",       # The name of your project in wandb
-            name=f"{model.config['architecture']}",   # (Optional) Name of this specific run
-            config=model.config               # Pass your dictionary here!
-        )
+        # wandb.init(
+        #     project="SPECTRA",       # The name of your project in wandb
+        #     name=f"{model.config['architecture']}",   # (Optional) Name of this specific run
+        #     config=model.config               # Pass your dictionary here!
+        # )
         wandb.watch(model, log="all", log_freq=10) # log="all" tracks both gradients and parameters
 
     for epoch in range(1, n_epochs + 1):
@@ -890,8 +922,8 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
                 model, 
                 batch, 
                 model.device, 
-                alpha=1.0, 
-                beta=0.01)
+                alpha=alpha_weight, 
+                beta=beta_weight)
             
             loss.backward()
 
@@ -925,22 +957,23 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
         print(f'training KL = {epoch_kl:.5f} | mse = {epoch_mse:.3f} | cos = {epoch_cos:.3f}')
 
         # save current epoch weights
-        filepath = os.path.join(weights_dir, f"weights__model-{model.architecture_name}_epoch-{epoch}__nodes-{model.num_nodes}_b-{batch_size}_h-{model.n_channels}_p-{model.dropout_p}.pth")
-        torch.save(model.state_dict(), filepath)
+        # filepath = os.path.join(weights_dir, f"weights__model-{model.architecture_name}_epoch-{epoch}__nodes-{model.num_nodes}_b-{batch_size}_h-{model.n_channels}_p-{model.dropout_p}.pth")
+        # torch.save(model.state_dict(), filepath)
         
         # Validation & Early Stopping
         if epoch!=0:
 
             # We assume this returns your primary metric (MMD)
-            val_metric = test_perturb_model(model, test_loader, device)
-            test_wmse.append(val_metric)
+            avg_pert_mmd, avg_pert_wmse = test_perturb_model(model, test_loader, device)
+            test_wmse.append(avg_pert_wmse)
+            test_mmd.append(avg_pert_mmd)
 
             # Check if this is the best model so far
-            is_best = (val_metric > best_val_metric) if metric_mode == 'max' else (val_metric < best_val_metric)
+            is_best = (avg_pert_wmse > best_val_metric) if metric_mode == 'max' else (avg_pert_wmse < best_val_metric)
 
             if is_best:
-                print(f"Validation metric improved to {val_metric:.4f}. Saving best model...")
-                best_val_metric = val_metric
+                print(f"Validation metric improved to {avg_pert_wmse:.4f}. Saving best model...")
+                best_val_metric = avg_pert_wmse
                 patience_counter = 0
                 torch.save(model.state_dict(), best_filepath)
             else:
@@ -957,7 +990,8 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
                     "train/kl_divergence": epoch_kl,
                     "train/mse": epoch_mse,
                     "train/cosine_loss": epoch_cos,
-                    "val/test_MMD": val_metric # Renamed slightly for clarity
+                    "val/test_WMSE": avg_pert_wmse, # Renamed slightly for clarity
+                    "val/test_MMD": avg_pert_mmd
                 })
 
             # Trigger Early Stopping
@@ -984,4 +1018,4 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
 
     wandb.finish()
     
-    return mmd_pert, mmd_ctrl, test_wmse
+    return mmd_pert, test_mmd, test_wmse

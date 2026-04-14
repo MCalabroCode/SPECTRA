@@ -239,7 +239,7 @@ def compute_degs(adata, mode='vsrest', pval_threshold=0.05):
     sc.tl.rank_genes_groups(
         adata_subset, 
         'target_gene', 
-        method='wilcoxon', # t-test_overestim_var
+        method='t-test_overestim_var', # t-test_overestim_var
         reference=reference, 
         use_raw=False   
     )
