@@ -150,7 +150,7 @@ if __name__ == '__main__':
 
     if args.sweep_id is None:
         # CREATOR MODE: Instantly creates sweep ID and exits. ZERO data loaded.
-        sweep_id = wandb.sweep(sweep_config, project="SPECTRA-Sweep")
+        sweep_id = wandb.sweep(sweep_config, project="SPECTRA-Sweep-2")
         print("\n" + "="*50)
         print(f"🎉 SWEEP INITIALIZED! Your Sweep ID is: {sweep_id}")
         print("="*50 + "\n")
@@ -162,4 +162,4 @@ if __name__ == '__main__':
         GLOBAL_ADATA, GLOBAL_EDGE_INDEX, GLOBAL_EMBEDDINGS, GLOBAL_GENE_TO_IDX, GLOBAL_NUM_NODES = load_all_data()
         
         # This agent will now run 'sweep_train' args.count times, reusing the memory!
-        wandb.agent(args.sweep_id, project="SPECTRA-Sweep", function=sweep_train, count=args.count)
+        wandb.agent(args.sweep_id, project="SPECTRA-Sweep-2", function=sweep_train, count=args.count)

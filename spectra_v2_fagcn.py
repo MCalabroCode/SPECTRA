@@ -55,10 +55,6 @@ class GeneExpressionFiLM(nn.Module):
         # We shift it so gamma starts at exactly 1.0.
         
         gamma = self.scale(expr) 
-        # If you want to bound it strictly to [0, 2]:
-        #gamma = 1.0 + torch.tanh(gamma) 
-        
-        # Or, if you want an unbounded, strictly positive scale (Highly Recommended):
         gamma = 1.0 + F.elu(gamma) # Starts at 1.0, can't go below 0, can grow infinitely
         
         beta = self.shift_scale * self.shift(expr)
@@ -315,15 +311,23 @@ class FeatureDecoder(torch.nn.Module):
 
         self.last_layer = torch.nn.Linear(n_channels, num_node_features) 
 
-    def forward(self, z, edge_index):
+    def forward(self, z, edge_index, return_alpha=False):
         # In the decoder, the latent representation 'z' acts as the raw feature (x_0)
         x_0 = z 
 
-        h1 = self.conv1(z, edge_index, x_res=x_0)
+        if return_alpha:
+            h1, alpha_dict_1 = self.conv1(z, edge_index, x_res=x_0, return_alpha=True)
+        else:
+            h1 = self.conv1(z, edge_index, x_res=x_0)
         h1 = self.ln1(h1)
         h1_out = F.gelu(h1)
 
         h1_drop = F.dropout(h1_out, p=self.dropout_rate, training=self.training)
+
+        if return_alpha:
+            h2, alpha_dict_2 = self.conv2(h1_drop, edge_index, x_res=x_0, return_alpha=True)
+        else:
+            h2 = self.conv2(h1_drop, edge_index, x_res=x_0)
         h2 = self.conv2(h1_drop, edge_index, x_res=x_0)
         h2 = self.ln2(h2)
         h2_out = F.gelu(h2)
@@ -338,9 +342,14 @@ class FeatureDecoder(torch.nn.Module):
         
         # LeakyReLU during training to prevent dead gradients, hard ReLU for biological realism at eval
         if self.training:
-            return F.leaky_relu(out, negative_slope=0.05) 
+            out = F.leaky_relu(out, negative_slope=0.05) 
         else:
-            return F.relu(out)
+            out = F.relu(out)
+        
+        if return_alpha:
+            return out, (alpha_dict_1, alpha_dict_2)
+        
+        return out
 
 
 class PerturbModel(torch.nn.Module):
@@ -451,7 +460,7 @@ class PerturbModel(torch.nn.Module):
         #kl_per_dim_clamped = torch.clamp(kl_per_dim, min=free_bits)
         return torch.mean(kl_per_dim)
 
-    def forward(self, data, return_latent=True):
+    def forward(self, data, return_attention_weights=False):
 
         x, pert = data
         x = x.to(self.device) #[B,N,1]
@@ -483,6 +492,7 @@ class PerturbModel(torch.nn.Module):
 
         z_ctrl = self.reparametrize(mu, logstd)     
         self.last_z = z_ctrl
+
         x_hat = self.gex_decoder(z_ctrl, edge_index_batch)
         
         # additive logic for perturbation encoding
@@ -537,25 +547,100 @@ class PerturbModel(torch.nn.Module):
         mu_pert = mu + delta_mu
         logstd_pert = logstd #+ delta_logstd
         z_pert = self.reparametrize(mu_pert, logstd_pert)
-        y_hat = self.gex_decoder(z_pert, edge_index_batch)
 
-        # print(self.ko_token.weight)
-        # print('======= mean mu before pert =========')
-        # print(mu[mask.bool().squeeze(-1)].mean(dim=0)) # mean of mu value BEFORE perturbation in node that is about to be perturbed
-        # print('======= mean mu after pert ==========')
-        # print(mu_pert[mask.bool().squeeze(-1)].mean(dim=0)) # mean of mu value AFTER perturbation in node that is about to be perturbed
-        # print('=================')
-        # print('=================')
-        # # OK I HAVE CHEKCED - PERTURBATION SIGNAL IS ACTUALLY QUITE STRONG
+        if return_attention_weights:
+            y_hat, (alpha_dict_1, alpha_dict_2) = self.gex_decoder(z_pert, edge_index_batch, return_alpha=True)
 
-        # mu_pert = mu + (mask * self.ko_token.weight)  #[1,C]
-        # logstd_pert = logstd # + delta_logstd
-        # z_pert = self.reparametrize(mu_pert, logstd_pert)
-        # y_hat = self.gex_decoder(z_pert, edge_index_batch)
+            # Grab the incoming gating weights for Layer 1 and 2
+            alpha_L1_batched = alpha_dict_1['alpha_in'] # Shape: [B * E]
+            alpha_L2_batched = alpha_dict_2['alpha_in'] # Shape: [B * E]
+
+            E = self.edge_index.shape[1]
+
+            # 4. MEMORY-EFFICIENT BATCH AVERAGING
+            alpha_L1_average = alpha_L1_batched.reshape(batch_size, E).mean(dim=0)
+            alpha_L2_average = alpha_L2_batched.reshape(batch_size, E).mean(dim=0)
+
+            # 5. BUILD MATRICES AND MULTIPLY
+            N = self.num_nodes
+            
+            # Using self.edge_index (which is safely on self.device)
+            A_L1 = torch.sparse_coo_tensor(self.edge_index, alpha_L1_average, (N, N)).to_dense()
+            A_L2 = torch.sparse_coo_tensor(self.edge_index, alpha_L2_average, (N, N)).to_dense()
+
+            # The Aggregate Attention Graph
+            A_Agg = torch.matmul(A_L2, A_L1)
+            
+            return A_Agg, y_hat, x_hat
+
+        else:
+            y_hat = self.gex_decoder(z_pert, edge_index_batch)
+            return y_hat, x_hat
+
+    @torch.no_grad()
+    def get_attention_graph(self, data):
+        """
+        Computes the global, multi-hop Attention Graph for a given batch.
+        Assumes the batch contains cells of a SINGLE perturbation type.
+        """
+        self.eval() # Ensure we are in eval mode (no dropout)
         
-        return y_hat, x_hat
+        x, pert = data
+        x = x.to(self.device) 
+        pert = pert.to(self.device) 
 
+        batch_size, num_nodes, num_features = x.shape
+        edge_index_batch = self._get_batched_edge_index(batch_size)
+        pert = pert.reshape(batch_size * num_nodes) 
 
+        # 1. ENCODER PASS
+        gene_ids = self._get_batched_gene_ids(batch_size) 
+        scgpt_base = self.gene_embeddings(gene_ids) 
+        x_flat = x.reshape(batch_size * num_nodes, 1) 
+
+        gene_proj = self.project_gene(scgpt_base)   
+        x_node_features = self.film_layer(gene_proj, x_flat)
+
+        mu, logstd = self.encoder(x_node_features, edge_index_batch) 
+        logstd = torch.clamp(logstd, min=-20, max=10) 
+
+        # 2. PERTURBATION INJECTION
+        pert_mask = pert.bool()
+        delta_mu = torch.zeros_like(mu)
+        if pert_mask.any():
+            perturbed_gene_ids = gene_ids[pert_mask]
+            ko_embeddings = self.ko_mu(perturbed_gene_ids)
+            mu_shift = self.ko_mlp(ko_embeddings)
+            delta_mu[pert_mask] = mu_shift
+
+        mu_pert = mu + delta_mu
+        z_pert = self.reparametrize(mu_pert, logstd)
+        
+        # 3. DECODER PASS (Extracting Alphas)
+        _, (alpha_dict_1, alpha_dict_2) = self.gex_decoder(z_pert, edge_index_batch, return_alpha=True)
+        
+        # Grab the incoming gating weights for Layer 1 and 2
+        alpha_L1_batched = alpha_dict_1['alpha_in'] # Shape: [B * E]
+        alpha_L2_batched = alpha_dict_2['alpha_in'] # Shape: [B * E]
+
+        E = self.edge_index.shape[1]
+
+        # 4. MEMORY-EFFICIENT BATCH AVERAGING
+        alpha_L1_average = alpha_L1_batched.reshape(batch_size, E).mean(dim=0)
+        alpha_L2_average = alpha_L2_batched.reshape(batch_size, E).mean(dim=0)
+
+        # 5. BUILD MATRICES AND MULTIPLY
+        N = self.num_nodes
+        
+        # Using self.edge_index (which is safely on self.device)
+        A_L1 = torch.sparse_coo_tensor(self.edge_index, alpha_L1_average, (N, N)).to_dense()
+        A_L2 = torch.sparse_coo_tensor(self.edge_index, alpha_L2_average, (N, N)).to_dense()
+
+        # The Aggregate Attention Graph
+        A_Agg = torch.matmul(A_L2, A_L1)
+        
+        return A_Agg, A_L1, A_L2
+    
     def predict_full_expression(self, data):
         self.eval()
         return self.forward(data)[0]
@@ -866,11 +951,27 @@ def test_perturb_model_new(model, loader, device, var_names, idx_to_gene):
 
     return average
 
-def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support, var_names, idx_to_gene, alpha_weight, beta_weight, patience=5, metric_mode='min'):
+def train(model, 
+    train_loader, 
+    test_loader, 
+    lr, 
+    n_epochs, 
+    device, 
+    wandb_support, 
+    var_names, 
+    idx_to_gene, 
+    alpha_weight, 
+    beta_weight, 
+    patience=5, 
+    metric_mode='min'
+):
     """
     metric_mode: Set to 'max' if your validation metric is AUPRC/Accuracy (higher is better). 
                  Set to 'min' if your validation metric is MMD/MSE/Loss (lower is better).
     """
+
+    torch.autograd.set_detect_anomaly(True)
+
     global_loss = []
     mmd_pert = []
     mmd_ctrl = []
@@ -890,11 +991,10 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
     # Early Stopping Setup
     best_val_metric = float('-inf') if metric_mode == 'max' else float('inf')
     patience_counter = 0
-
     if wandb_support and wandb.run is not None:
-        best_filepath = f"best_model_{wandb.run.id}.pt"
+        best_filepath = os.path.join(weights_dir,f"best_model_{model.architecture_name}_{wandb.run.id}.pth")
     else:
-        best_filepath = f"best_model_{uuid.uuid4().hex}.pt"
+        best_filepath = os.path.join(weights_dir, f"best_model_{model.architecture_name}_{uuid.uuid4().hex}.pth")
 
     # wandb watch
     if wandb_support:
@@ -969,11 +1069,11 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
             test_mmd.append(avg_pert_mmd)
 
             # Check if this is the best model so far
-            is_best = (avg_pert_wmse > best_val_metric) if metric_mode == 'max' else (avg_pert_wmse < best_val_metric)
+            is_best = (avg_pert_mmd > best_val_metric) if metric_mode == 'max' else (avg_pert_mmd < best_val_metric)
 
             if is_best:
-                print(f"Validation metric improved to {avg_pert_wmse:.4f}. Saving best model...")
-                best_val_metric = avg_pert_wmse
+                print(f"Validation metric improved to {avg_pert_mmd:.4f}. Saving best model...")
+                best_val_metric = avg_pert_mmd
                 patience_counter = 0
                 torch.save(model.state_dict(), best_filepath)
             else:
@@ -998,10 +1098,11 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
             if patience_counter >= patience:
                 print(f"Early stopping triggered! No improvement for {patience} epochs.")
                 break
-        
+    
     # ==========================================
     # FINAL EVALUATION PHASE
     # ==========================================
+    torch.autograd.set_detect_anomaly(False)
     print("\n--- Training concluded. Initiating Final Evaluation ---")
     
     # Reload the absolute best weights before running the final metric
@@ -1015,7 +1116,5 @@ def train(model, train_loader, test_loader, lr, n_epochs, device, wandb_support,
     
     if wandb_support:
         wandb.log({"val/AUPRC": final_metric_val})
-
-    wandb.finish()
     
     return mmd_pert, test_mmd, test_wmse
