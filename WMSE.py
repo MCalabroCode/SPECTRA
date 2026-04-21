@@ -166,7 +166,8 @@ def compute_weights(adata, gene_to_idx, cells_per_pert=256, score_type = 'scores
 
         # Order by the var_names
         weights = weights.reindex(adata.var_names, fill_value=0.0)
-        final_weight_dict[gene_to_idx[pert]] = weights.values # TODO: adapt for multiple perturbations!! (I think it is enough to just build the dictionary with perturbations as keys, and not the genes!)
+        #final_weight_dict[gene_to_idx[pert]] = weights.values # TODO: adapt for multiple perturbations!! (I think it is enough to just build the dictionary with perturbations as keys, and not the genes!)
+        final_weight_dict[pert] = weights.values #NOTE: new code to adapt on multiple perturbations
 
     return final_weight_dict
 

@@ -88,12 +88,12 @@ def chunk(indices, chunk_size):
         return None
 
 class PerturbationDataset(Dataset):
-    def __init__(self, adata, gene_to_idx, edge_index, start_idx=0, end_idx=None):
+    def __init__(self, adata, gene_to_idx, pert_to_idx, start_idx=0, end_idx=None):
         #TODO: edge_index can probably be removed
         super().__init__()
 
-        self.edge_index = edge_index.share_memory_()
         self.gene_to_idx = gene_to_idx
+        self.pert_to_idx = pert_to_idx
         self.start_idx = start_idx
         self.end_idx = end_idx if end_idx is not None else len(adata)
 
@@ -130,23 +130,24 @@ class PerturbationDataset(Dataset):
     def __getitem__(self, idx):
 
         j = np.random.randint(0, self.ctrl_samples.shape[0]) #random control cell
-        
-        # x = self.ctrl_samples[j].view(-1,1)
-        # y = self.ptb_samples[idx].view(-1,1)
 
-        # NEW FIX: Convert ONLY these two specific cells to dense arrays on the fly
+        # Convert ONLY these two specific cells to dense arrays on the fly
         x_dense = self.ctrl_samples[j].toarray().squeeze()
         y_dense = self.ptb_samples[idx].toarray().squeeze()
         x = torch.tensor(x_dense, dtype=torch.float).view(-1, 1)
         y = torch.tensor(y_dense, dtype=torch.float).view(-1, 1)
-        pert = self._pert_embedding(self.ptb_names[idx])
 
-        return x,y,pert
+        pert_name = self.ptb_names[idx]
+        pert = self._pert_embedding(pert_name)
+
+        pert_condition_idx = torch.tensor(self.pert_to_idx[pert_name], dtype=torch.long)
+
+        return x,y,pert, pert_condition_idx
 
     def __len__(self):
         return self.ptb_samples.shape[0]
 
-def build_model_dataloaders(adata, edge_index, config):
+def build_model_dataloaders(adata, config):
     
     #TODO: add sanity check for dataset_size (must be inferior than the number of the perturbed cells, see how the sampling works)
 
@@ -158,23 +159,25 @@ def build_model_dataloaders(adata, edge_index, config):
     val_size = int(dataset_size * val_ratio)
     train_size = dataset_size - test_size - val_size
 
+    pert_to_idx = config.get('pert_to_idx')
+
     gene_to_idx = {node: i for i, node in enumerate(adata.var_names)}
 
     # Create datasets
     train_dataset = PerturbationDataset(
-        adata, gene_to_idx, edge_index,
+        adata, gene_to_idx, pert_to_idx,
         start_idx=0, 
         end_idx=train_size
     )
 
     val_dataset = PerturbationDataset(
-        adata, gene_to_idx, edge_index,
+        adata, gene_to_idx, pert_to_idx,
         start_idx=train_size, 
         end_idx=train_size+val_size
     )
 
     test_dataset = PerturbationDataset(
-        adata, gene_to_idx, edge_index,
+        adata, gene_to_idx, pert_to_idx,
         start_idx=train_size+val_size, 
         end_idx=dataset_size
     )
@@ -193,13 +196,15 @@ def build_model_dataloaders(adata, edge_index, config):
 
     return train_loader, val_loader, test_loader, len(train_dataset), len(test_dataset), len(val_dataset)
 
-def build_model_dataloaders_split_perturbs_leak(adata, edge_index, config):
+def build_model_dataloaders_split_perturbs_leak(adata, config):
     
     test_ratio = config.get('test_ratio', 0.1)
     val_ratio = config.get('val_ratio', 0.1)
     batch_size = config.get('batch_size', 32)
     N_WORKERS = 4 
     
+    pert_to_idx = config.get('pert_to_idx')
+
     # Isolate controls and unique perturbations
     ctrl_adata = adata[adata.obs['target_gene'] == 'non-targeting'].copy()
     unique_perts = adata.obs['target_gene'].unique().tolist()
@@ -229,9 +234,9 @@ def build_model_dataloaders_split_perturbs_leak(adata, edge_index, config):
 
     # 6. Create datasets 
     # (Since we pass pre-split adatas, we don't need start_idx/end_idx anymore)
-    train_dataset = PerturbationDataset(train_adata, gene_to_idx, edge_index)
-    val_dataset = PerturbationDataset(val_adata, gene_to_idx, edge_index)
-    test_dataset = PerturbationDataset(test_adata, gene_to_idx, edge_index)
+    train_dataset = PerturbationDataset(train_adata, gene_to_idx, pert_to_idx)
+    val_dataset = PerturbationDataset(val_adata, gene_to_idx, pert_to_idx)
+    test_dataset = PerturbationDataset(test_adata, gene_to_idx, pert_to_idx)
 
     # Create loaders
     train_loader = DataLoader(train_dataset, batch_sampler=SCDATA_sampler(train_dataset, batch_size), num_workers=N_WORKERS, pin_memory=True)
@@ -245,12 +250,14 @@ def build_model_dataloaders_split_perturbs_leak(adata, edge_index, config):
 
     return train_loader, val_loader, test_loader, len(train_dataset), len(test_dataset), len(val_dataset)
 
-def build_model_dataloaders_split_perturbs(adata, edge_index, config):
+def build_model_dataloaders_split_perturbs(adata, config):
     
     test_ratio = config.get('test_ratio', 0.1)
     val_ratio = config.get('val_ratio', 0.1)
     batch_size = config.get('batch_size', 32)
     N_WORKERS = 4 
+
+    pert_to_idx = config.get('pert_to_idx')
     
     # Isolate controls and unique perturbations
     ctrl_adata = adata[adata.obs['target_gene'] == 'non-targeting'].copy()
@@ -293,9 +300,9 @@ def build_model_dataloaders_split_perturbs(adata, edge_index, config):
 
     # 6. Create datasets 
     # (Since we pass pre-split adatas, we don't need start_idx/end_idx anymore)
-    train_dataset = PerturbationDataset(train_adata, gene_to_idx, edge_index)
-    val_dataset = PerturbationDataset(val_adata, gene_to_idx, edge_index)
-    test_dataset = PerturbationDataset(test_adata, gene_to_idx, edge_index)
+    train_dataset = PerturbationDataset(train_adata, gene_to_idx, pert_to_idx)
+    val_dataset = PerturbationDataset(val_adata, gene_to_idx, pert_to_idx)
+    test_dataset = PerturbationDataset(test_adata, gene_to_idx, pert_to_idx)
 
     # Create loaders
     train_loader = DataLoader(train_dataset, batch_sampler=SCDATA_sampler(train_dataset, batch_size), num_workers=N_WORKERS, pin_memory=True)

@@ -1,12 +1,9 @@
-import os
 import torch
-import json
 import networkx as nx
 import scanpy as sc
 import numpy as np
 import pandas as pd
 import random
-import os
 import wandb
 import pickle
 
@@ -53,7 +50,7 @@ network_data = pd.read_csv('../SCENIC_GRNs/SCENIC_GRNs/temp_results/replogle_adj
 G = nx.DiGraph()
 for i in range(network_data.shape[0]):
     edge = network_data.iloc[i,:]
-    if np.abs(edge['importance'])>0.1: #TODO: dumb pruning, make somehting better please
+    if np.abs(edge['importance'])>0.2: #TODO: dumb pruning, make somehting better please
         G.add_edge(edge['TF'], edge['target'], weight=edge['importance'])
 
 G.remove_nodes_from([n for n in G.nodes if n not in scgpt_dict])
@@ -90,16 +87,16 @@ config = dict(
     dataset_size=adata.shape[0],#(adata.obs['target_gene'] != 'non-targeting').sum(),
     test_ratio=0.2,
     val_ratio=0.1,
-    batch_size=24,
-    n_channels=32,
-    dropout_p=0.1,
+    batch_size=48,
+    n_channels=24,
+    dropout_p=0.06,
     num_node_features=1,
     lr=0.001,
     n_epochs=20,
-    alpha = 4.,
-    beta = 0.01,
-    dataset="Replogle",
-    architecture="FAGCN")
+    alpha = 3.5,
+    beta = 0.0,
+    dataset="replogle",
+    architecture="FAGCN_FiLM_new_weights")
 
 # map genes to gene names for scGPT
 scgpt_dict = {gene_to_idx[k]: v for k, v in scgpt_dict.items() if k in gene_to_idx}
@@ -110,24 +107,27 @@ embedding_matrix = torch.zeros((num_nodes, scgpt_dim))
 for gene_id, emb in scgpt_dict.items():
     embedding_matrix[gene_id] = torch.tensor(emb, dtype=torch.float32)
 
+perturbations = list(adata.obs['target_gene'].unique())
+perturbations.remove('non-targeting')
+pert_to_idx = {pert: i for i, pert in enumerate(perturbations)}
+config['pert_to_idx']=pert_to_idx
 
 ######## dataloaders preparation
 
 from utils import build_model_dataloaders_split_perturbs
 
-train_loader, val_loader, test_loader, train_size, test_size, _, train_adata, _, test_adata = build_model_dataloaders_split_perturbs(adata, edge_index, config)
+train_loader, val_loader, test_loader, train_size, test_size, _, train_adata, _, test_adata = build_model_dataloaders_split_perturbs(adata, config)
 
 ######### DEG weights
 
 # load gene weights
-with open('gene_weights_replogle.pkl', 'rb') as f:
+with open('gene_weights_replogle_new.pkl', 'rb') as f:
     gene_weights = pickle.load(f)
 
 ######### model setup
 
 wandb.init(
     project="SPECTRA_replogle",       # The name of your project in wandb
-    name=config['architecture'],   # (Optional) Name of this specific run
     config=config               # Pass your dictionary here!
 )
 

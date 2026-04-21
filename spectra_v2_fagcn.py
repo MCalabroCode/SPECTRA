@@ -38,7 +38,7 @@ class GeneExpressionFiLM(nn.Module):
         self.shift = nn.Linear(1, emb_dim)
         self.shift_scale = shift_scale
         
-        # CRITICAL: Zero-initialize so the layer starts as a pure Identity mapping
+        # Zero-initialize so the layer starts as a pure Identity mapping
         nn.init.zeros_(self.scale.weight)
         nn.init.zeros_(self.scale.bias)
         nn.init.zeros_(self.shift.weight)
@@ -48,17 +48,10 @@ class GeneExpressionFiLM(nn.Module):
 
         # gene_emb: [B*N, D]
         # expr: [B*N, 1]
-
-        # Softplus allows gamma to grow naturally > 1 without saturating, 
-        # but prevents it from ever going negative (which would flip the embedding vector)
-        # Because scale is 0-initialized, Softplus(0) = 0.69. 
-        # We shift it so gamma starts at exactly 1.0.
         
         gamma = self.scale(expr) 
         gamma = 1.0 + F.elu(gamma) # Starts at 1.0, can't go below 0, can grow infinitely
-        
         beta = self.shift_scale * self.shift(expr)
-
         return gamma * gene_emb + beta
 
 class DirectedFAGCNConv(MessagePassing):
@@ -220,16 +213,12 @@ class DirectedFAGCNConv(MessagePassing):
 
 ##########
 
-
 class VariationalGraphEncoder(torch.nn.Module):
     ''' encoder class adapted for DirGNN + FAGCN '''
     def __init__(self, in_channels, out_channels, dropout_rate = 0.2):
         super().__init__()
         self.out_channels = out_channels
         self.dropout_rate = dropout_rate
-
-        # Linear projections to replace ChebConv's dimensionality changes
-        # self.proj_in = torch.nn.Linear(in_channels, 2*out_channels)
         
         self.proj_mu = torch.nn.Linear(out_channels, out_channels)
         self.proj_logstd = torch.nn.Linear(out_channels, out_channels)
@@ -246,9 +235,6 @@ class VariationalGraphEncoder(torch.nn.Module):
 
     def forward(self, x, edge_index):
 
-        # Project inputs to establish the base features (x_0) for this layer
-        # h_0 = self.proj_in(x) 
-        # h_0 = F.gelu(h_0)
         h_0 = x
 
         x_1 = self.conv1(h_0, edge_index, x_res=h_0) 
@@ -368,16 +354,26 @@ class PerturbModel(torch.nn.Module):
         #self.num_node_features = config['num_node_features'] 
         
         self.register_buffer('edge_index', edge_index)
-        #self.edge_dropout_p = edge_dropout_p
 
-        # Weight Lookup Construction for WMSE
-        default_weights = (1/num_nodes)*torch.ones(num_nodes)
-        weight_lookup = default_weights.unsqueeze(0).repeat(num_nodes + 1, 1).to(device)    
+        # # Weight Lookup Construction for WMSE
+        # default_weights = (1/num_nodes)*torch.ones(num_nodes)
+        # weight_lookup = default_weights.unsqueeze(0).repeat(num_nodes + 1, 1).to(device)    
+        # if gene_weights is not None:
+        #     for pert_idx, weight_array in gene_weights.items():
+        #         w_tensor = torch.tensor(weight_array, dtype=torch.float32, device=device)
+        #         if 0 <= pert_idx < num_nodes:
+        #             weight_lookup[pert_idx] = w_tensor
+        # self.register_buffer('weight_lookup', weight_lookup)
+
+        num_conditions = len(config['pert_to_idx'])
+        default_weights = (1.0 / num_nodes) * torch.ones(num_nodes) # Default flat weights if no DEGs provided
+        weight_lookup = default_weights.unsqueeze(0).repeat(num_conditions, 1).to(device)    
         if gene_weights is not None:
-            for pert_idx, weight_array in gene_weights.items():
-                w_tensor = torch.tensor(weight_array, dtype=torch.float32, device=device)
-                if 0 <= pert_idx < num_nodes:
-                    weight_lookup[pert_idx] = w_tensor
+            for pert_name, weight_array in gene_weights.items(): # gene_weights has string keys like 'GeneA+GeneB'
+                if pert_name in config['pert_to_idx']:
+                    idx = config['pert_to_idx'][pert_name]
+                    w_tensor = torch.tensor(weight_array, dtype=torch.float32, device=device)
+                    weight_lookup[idx] = w_tensor
         self.register_buffer('weight_lookup', weight_lookup)
         
         self.gene_embeddings = torch.nn.Embedding.from_pretrained(gene_embeddings, freeze=True)
@@ -785,7 +781,7 @@ def compute_mmd(x, y, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
     return loss
 
 def train_step_perturb_model(model, data, device, alpha=1., beta=1., mmd_gamma=0.0):
-    x, y, pert = data  # x,y: [B,N,1], pert: [B,N]
+    x, y, pert, pert_idx = data  # x,y: [B,N,1], pert: [B,N]
     x, y, pert = x.to(device), y.to(device), pert.to(device)
 
     B, N, _ = x.shape
@@ -809,8 +805,10 @@ def train_step_perturb_model(model, data, device, alpha=1., beta=1., mmd_gamma=0
     y_pred = y_hat.view(B, N)
 
     # ---- NEW: Extract perturbation weights for this batch ----
-    pert_idx = pert[0].int().argmax().item()
-    batch_weights = model.weight_lookup[pert_idx].to(device).reshape(-1)
+    # pert_idx = pert[0].int().argmax().item()
+    # batch_weights = model.weight_lookup[pert_idx].to(device).reshape(-1)
+    batch_pert_idx = pert_idx[0].item() # Guaranteed identical across the batch!
+    batch_weights = model.weight_lookup[batch_pert_idx]
 
     # Compute pseudobulk - used for proper cosine similarity
     x_true_mean = x_true.mean(dim=0) # [N]
@@ -850,7 +848,7 @@ def test_perturb_model(model, loader, device):
     pert_mmd = []
     pert_wmse = []
     for i, data in enumerate(tqdm(loader, desc='testing...')):
-        x, y, pert = data
+        x, y, pert, pert_idx = data
         x, y, pert = x.to(device), y.to(device), pert.to(device)
 
         B = pert.shape[0]
@@ -859,30 +857,32 @@ def test_perturb_model(model, loader, device):
         y_hat, _ = model((x,pert)) #[B*N,1]
         y_flat = y.reshape(-1, 1) #[B*N,1]
 
-        # weights
-        is_control = pert.sum(dim=1) == 0
-        pert_indices = pert.int().argmax(dim=1)
-        weight_lookup_indices = torch.where(
-            is_control, 
-            torch.tensor(model.num_nodes, device=device), 
-            pert_indices
-        )
-        specific_weights = model.weight_lookup[weight_lookup_indices] #shape: [B, N]
+        # # weights
+        # is_control = pert.sum(dim=1) == 0
+        # pert_indices = pert.int().argmax(dim=1)
+        # weight_lookup_indices = torch.where(
+        #     is_control, 
+        #     torch.tensor(model.num_nodes, device=device), 
+        #     pert_indices
+        # )
+        # specific_weights = model.weight_lookup[weight_lookup_indices] #shape: [B, N]
+        batch_pert_idx = pert_idx[0].item()
+        specific_weights = model.weight_lookup[batch_pert_idx].view(1, N)
 
         squared_error = (y_hat - y_flat)**2 # Shape: [B*N, 1]
         
         # Reshape to [B, N] to match weights
         squared_error_batch = squared_error.reshape(B, N)
-        weights_batch = specific_weights.reshape(B, N)
+        #weights_batch = specific_weights.reshape(B, N)
         
         # Calculate Weighted MSE
-        loss_per_cell = torch.sum(squared_error_batch * weights_batch, dim=1)
+        # PyTorch automatically broadcasts the [1, N] weights across the [B, N] error batch
+        loss_per_cell = torch.sum(squared_error_batch * specific_weights, dim=1)
         error = torch.mean(loss_per_cell)
         pert_wmse.append(error.item())
 
         # mmd
         mmd_error = compute_mmd(y_flat.view(B,N), y_hat.view(B,N))
-
         pert_mmd.append(mmd_error.item())
 
     avg_pert_mmd = sum(pert_mmd)/len(pert_mmd)
@@ -900,7 +900,7 @@ def test_perturb_model_new(model, loader, device, var_names, idx_to_gene):
     
     # 1. Accumulate all predictions and ground truths
     for i, data in enumerate(tqdm(loader, desc='testing with AUPRC...')):
-        x, y, pert = data
+        x, y, pert, pert_idx = data
         x, y, pert = x.to(device), y.to(device), pert.to(device)
 
         B = pert.shape[0]
@@ -1069,11 +1069,11 @@ def train(model,
             test_mmd.append(avg_pert_mmd)
 
             # Check if this is the best model so far
-            is_best = (avg_pert_mmd > best_val_metric) if metric_mode == 'max' else (avg_pert_mmd < best_val_metric)
+            is_best = (avg_pert_wmse > best_val_metric) if metric_mode == 'max' else (avg_pert_wmse < best_val_metric)
 
             if is_best:
-                print(f"Validation metric improved to {avg_pert_mmd:.4f}. Saving best model...")
-                best_val_metric = avg_pert_mmd
+                print(f"Validation metric improved to {avg_pert_wmse:.4f}. Saving best model...")
+                best_val_metric = avg_pert_wmse
                 patience_counter = 0
                 torch.save(model.state_dict(), best_filepath)
             else:

@@ -1,4 +1,5 @@
 import anndata as ad
+import numpy as np
 import argparse
 import os
 import gc  # Garbage collection to free up memory
@@ -19,7 +20,7 @@ METRICS_REGISTRY = {
     "auprc":calc_auprc
 }
 
-def process_datasets(real_path, pred_paths, metrics=None):
+def process_datasets(real_path, pred_paths, top_degs, metrics=None):
     """
     Loads the real dataset once, then iterates through prediction files
     one by one to compare, save, and free memory.
@@ -64,7 +65,10 @@ def process_datasets(real_path, pred_paths, metrics=None):
         for metric_name in metrics:
             print(f"    -> Calculating {metric_name}...")
             metric_func = METRICS_REGISTRY[metric_name]
-            score = metric_func(real_adata, p_adata)
+            if metric_name in ['mse', 'kldiv', 'pcc_delta', 'edistance', 'wasserstein']:
+                score = metric_func(real_adata, p_adata, n_top_degs=top_degs)
+            else:
+                score = metric_func(real_adata, p_adata)
             results[metric_name][model_name] = score
 
         # 4. Free up memory
@@ -130,10 +134,16 @@ if __name__ == "__main__":
         help="Specify which metrics to run (e.g., --metrics mae kldiv). If omitted, runs all."
     )
 
+    parser.add_argument(
+        "--top_DEGs",
+        type=int,
+        help="Specify on which DEGs genes to run the metrics. If omitted, runs on all genes."
+    )
+
     args = parser.parse_args()
 
     # Pass args.metrics into the function
-    final_results = process_datasets(args.real, args.preds, metrics=args.metrics)
+    final_results = process_datasets(args.real, args.preds, args.top_DEGs, metrics=args.metrics)
     print("[*] All evaluations complete.")
 
 

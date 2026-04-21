@@ -20,5 +20,6 @@
 
 gene_to_idx.pkl
 gene_weights_replogle.pkl
+gene_weights_replogle_new.pkl
 gene_weights.py
 train_adata_for_gene_weights.h5ad

@@ -23,6 +23,7 @@ GLOBAL_EDGE_INDEX = None
 GLOBAL_EMBEDDINGS = None
 GLOBAL_GENE_TO_IDX = None
 GLOBAL_NUM_NODES = None
+GLOBAL_PERT_TO_IDX = None
 
 ######### W&B Sweep Configuration
 # Notice we removed 'dataset_size' from here because adata isn't loaded yet.
@@ -30,7 +31,7 @@ GLOBAL_NUM_NODES = None
 sweep_config = {
     'method': 'bayes',
     'metric': {
-        'name': 'val/test_MMD',
+        'name': 'val/test_WMSE',
         'goal': 'minimize'   
     },
     'early_terminate': {
@@ -56,7 +57,7 @@ def load_all_data():
     """Helper function to load data ONLY when an agent actually needs to train."""
     print("Loading datasets and graphs into memory...")
     adata = sc.read_h5ad('../data/vcc_data/adata_Training.h5ad')
-    adata = data_preprocessing(adata, 'target_gene', 'non-targeting')
+    adata = data_preprocessing(adata, 'gene', 'non-targeting', logtransform=True, min_cells_per_pert=100)
     
     with open("scGPT_embeddings_all_genes.pkl", "rb") as f:
         scgpt_dict = pickle.load(f)
@@ -84,14 +85,18 @@ def load_all_data():
     embedding_matrix = torch.zeros((G.number_of_nodes(), scgpt_dim))
     for gene_id, emb in scgpt_dict.items():
         embedding_matrix[gene_id] = torch.tensor(emb, dtype=torch.float32)
+    
+    perturbations = list(adata.obs['target_gene'].unique())
+    perturbations.remove('non-targeting')
+    pert_to_idx = {pert: i for i, pert in enumerate(perturbations)}
 
-    return adata, edge_index, embedding_matrix, gene_to_idx, G.number_of_nodes()
+    return adata, edge_index, embedding_matrix, gene_to_idx, pert_to_idx, G.number_of_nodes()
 
 
 ######### Sweep Training Wrapper
 def sweep_train():
     # Pull in the globals so we don't reload data!
-    global GLOBAL_ADATA, GLOBAL_EDGE_INDEX, GLOBAL_EMBEDDINGS, GLOBAL_GENE_TO_IDX, GLOBAL_NUM_NODES
+    global GLOBAL_ADATA, GLOBAL_EDGE_INDEX, GLOBAL_EMBEDDINGS, GLOBAL_GENE_TO_IDX, GLOBAL_PERT_TO_IDX, GLOBAL_NUM_NODES
     
     # LOCK SEEDS FIRST!
     import random
@@ -108,9 +113,10 @@ def sweep_train():
     with wandb.init() as run:
         w_config = wandb.config
         wandb.config.update({"dataset_size": GLOBAL_ADATA.shape[0]}, allow_val_change=True)
+        wandb.config.update({"pert_to_idx": GLOBAL_PERT_TO_IDX}, allow_val_change=True)
 
         # Use the globals!
-        train_loader, val_loader, test_loader, train_size, test_size, _, train_adata, _, _ = build_model_dataloaders_split_perturbs(GLOBAL_ADATA, GLOBAL_EDGE_INDEX, w_config)
+        train_loader, val_loader, test_loader, train_size, test_size, _, train_adata, _, _ = build_model_dataloaders_split_perturbs(GLOBAL_ADATA, w_config)
         gene_weights = compute_weights(train_adata, GLOBAL_GENE_TO_IDX, cells_per_pert=256)
         
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -150,7 +156,7 @@ if __name__ == '__main__':
 
     if args.sweep_id is None:
         # CREATOR MODE: Instantly creates sweep ID and exits. ZERO data loaded.
-        sweep_id = wandb.sweep(sweep_config, project="SPECTRA-Sweep-2")
+        sweep_id = wandb.sweep(sweep_config, project="SPECTRA-Sweep-WMSE")
         print("\n" + "="*50)
         print(f"🎉 SWEEP INITIALIZED! Your Sweep ID is: {sweep_id}")
         print("="*50 + "\n")
@@ -159,7 +165,7 @@ if __name__ == '__main__':
         print(f"Starting Agent for Sweep ID: {args.sweep_id}")
         
         # Load the data ONCE before starting the agent
-        GLOBAL_ADATA, GLOBAL_EDGE_INDEX, GLOBAL_EMBEDDINGS, GLOBAL_GENE_TO_IDX, GLOBAL_NUM_NODES = load_all_data()
+        GLOBAL_ADATA, GLOBAL_EDGE_INDEX, GLOBAL_EMBEDDINGS, GLOBAL_GENE_TO_IDX, GLOBAL_PERT_TO_IDX, GLOBAL_NUM_NODES = load_all_data()
         
         # This agent will now run 'sweep_train' args.count times, reusing the memory!
-        wandb.agent(args.sweep_id, project="SPECTRA-Sweep-2", function=sweep_train, count=args.count)
+        wandb.agent(args.sweep_id, project="SPECTRA-Sweep-WMSE", function=sweep_train, count=args.count)
