@@ -1,0 +1,31 @@
+project:
+  name: "SPECTRA_vcc_3layers"
+  seed: 42
+  deterministic: False
+  use_wandb: True
+
+data:
+  adata_path: "/scratch/michele.calabro/gears/VCC/SPECTRA/data/adata_vcc.h5ad"
+  gene_list_path: "/scratch/michele.calabro/gears/VCC/SPECTRA/data/gene_list-vcc.txt"
+  network_path: "/scratch/michele.calabro/gears/VCC/SPECTRA/data/graph_vcc.tsv"
+  scgpt_embeddings_path: "/scratch/michele.calabro/gears/VCC/SPECTRA/data/scGPT_embeddings_all_genes.pkl"
+  gene_weights_path: "/scratch/michele.calabro/gears/VCC/SPECTRA/data/gene_weights-vcc.pkl"
+
+model:
+  architecture: "3layers_FAGCN"
+  conv_type: 'FAGCN'
+  residual_weight: 0.9
+  n_channels: 16
+  dropout_p: 0.14
+  num_node_features: 1
+
+training:
+  batch_size: 48
+  lr: 0.001
+  n_epochs: 20
+  alpha: 3.
+  beta: 0.0006
+  gamma: 1.0
+  eta: 1.0
+  test_ratio: 0.2
+  val_ratio: 0.1

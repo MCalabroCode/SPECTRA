@@ -16,6 +16,8 @@
 /benchmark_figures
 /echoes
 /scgpt
+/obsolete
+/temp
 *.pth
 
 gene_to_idx.pkl

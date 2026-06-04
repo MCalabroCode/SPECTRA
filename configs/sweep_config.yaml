@@ -1,0 +1,63 @@
+project:
+  name: "SPECTRA_final_sweep_vcc_correct_2layers"
+  seed: 42
+  deterministic: True
+
+data:
+  adata_path: "/scratch/michele.calabro/gears/VCC/SPECTRA/data/adata_vcc.h5ad"
+  gene_list_path: "/scratch/michele.calabro/gears/VCC/SPECTRA/data/gene_list-vcc.txt"
+  network_path: "/scratch/michele.calabro/gears/VCC/SPECTRA/data/FUNGI_new_vcc.tsv"
+  scgpt_embeddings_path: "/scratch/michele.calabro/gears/VCC/SPECTRA/data/scGPT_embeddings_all_genes.pkl"
+  gene_weights_path: "/scratch/michele.calabro/gears/VCC/SPECTRA/data/gene_weights-vcc.pkl"
+
+# Weights & Biases Sweep Configuration
+sweep:
+  method: bayes
+  metric:
+    name: val/test_WMSE
+    goal: minimize
+  early_terminate:
+    type: hyperband
+    min_iter: 3
+    eta: 3
+  parameters:
+    test_ratio: 
+      value: 0.2
+    val_ratio: 
+      value: 0.1
+    batch_size: 
+      values: [16, 24, 32, 48]
+    n_channels: 
+      values: [16, 24, 32, 48, 64]
+    dropout_p: 
+      distribution: uniform
+      min: 0.0
+      max: 0.5
+    alpha: 
+      distribution: uniform
+      min: 0.1
+      max: 5.0
+    beta: 
+      distribution: log_uniform_values
+      min: 0.0001
+      max: 1.
+    gamma: 
+      distribution: uniform
+      min: 0.1
+      max: 5.0
+    eta: 
+      distribution: uniform
+      min: 0.1
+      max: 5.0
+    residual_weight: 
+      distribution: uniform
+      min: 0.
+      max: 1.
+    conv_type: 
+      value: 'FAGCN'
+    lr: 
+      value: 0.001
+    n_epochs: 
+      value: 20
+    architecture: 
+      value: "FAGCN_FiLM_2layers"
