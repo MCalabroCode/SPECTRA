@@ -7,6 +7,7 @@ import scanpy as sc
 import numpy as np
 import pandas as pd
 import warnings
+import uuid
 import os
 
 # Suppress annoying warnings for a clean console
@@ -160,6 +161,13 @@ def main(config):
         gamma_weight=model_config['gamma'],
         eta_weight=model_config['eta']
     )
+
+    weights_dir = "/scratch/michele.calabro/gears/VCC/SPECTRA/weights/finals"
+    if wandb_support and wandb.run is not None:
+        final_filepath = os.path.join(weights_dir,f"final_model_{model.architecture_name}_{wandb.run.id}.pth")
+    else:
+        final_filepath = os.path.join(weights_dir, f"final_model_{model.architecture_name}_{uuid.uuid4().hex}.pth")
+    torch.save(model.state_dict(), final_filepath)
 
     # exit
     if wandb_support:
