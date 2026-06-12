@@ -18,6 +18,7 @@
 /scgpt
 /obsolete
 /temp
+__pycache__/
 *.pth
 
 gene_to_idx.pkl

@@ -26,12 +26,12 @@ class VariationalGraphEncoder(torch.nn.Module):
         elif conv_type == 'DirGATv2':
             self.conv1 = DirGNN_GATv2(in_channels, out_channels)
             self.conv2 = DirGNN_GATv2(out_channels, out_channels)
-            self.conv_mu = DirGNN_GATv2(in_channels, out_channels)
+            self.conv_mu = DirGNN_GATv2(out_channels, out_channels)
             self.conv_logstd = DirGNN_GATv2(out_channels, out_channels)
         elif conv_type == 'DirPoly':
             self.conv1 = dir_poly_conv(in_channels, out_channels)
             self.conv2 = dir_poly_conv(out_channels, out_channels)
-            self.conv_mu = dir_poly_conv(in_channels, out_channels)
+            self.conv_mu = dir_poly_conv(out_channels, out_channels)
             self.conv_logstd = dir_poly_conv(out_channels, out_channels)
         else:
             raise ValueError(f"Convolution type {conv_type} is not supported!")
@@ -80,7 +80,7 @@ class FeatureDecoder(torch.nn.Module):
         if conv_type == 'FAGCN':
             self.conv1 = DirFAGCNConv(n_channels)
             self.conv2 = DirFAGCNConv(n_channels)
-            # self.conv3 = DirFAGCNConv(n_channels)
+            self.conv3 = DirFAGCNConv(n_channels) #comment
         elif conv_type == 'ChebConv':
             self.conv1 = ChebConv(n_channels, n_channels, K=1)
             self.conv2 = ChebConv(n_channels, n_channels, K=1)
@@ -96,7 +96,7 @@ class FeatureDecoder(torch.nn.Module):
 
         self.ln1 = LayerNorm(n_channels)
         self.ln2 = LayerNorm(n_channels)
-        # self.ln3 = LayerNorm(n_channels)
+        self.ln3 = LayerNorm(n_channels) #comment
         self.last_layer = torch.nn.Linear(n_channels, num_node_features) 
 
     def forward(self, z, edge_index, return_alpha=False):
@@ -120,17 +120,17 @@ class FeatureDecoder(torch.nn.Module):
         h2 = self.ln2(h2)
         h2_out = F.gelu(h2)
 
-        # h2_drop = F.dropout(h2_out, p=self.dropout_rate, training=self.training)
-        # if return_alpha:
-        #     h3, alpha_dict_3 = self.conv3(h2_drop, edge_index, return_alpha=True)
-        # else:
-        #     h3 = self.conv3(h2_drop, edge_index)
-        # h3 = h3 + self.eps * x_0
-        # h3 = self.ln3(h3)
-        # h3_out = F.gelu(h3)
+        h2_drop = F.dropout(h2_out, p=self.dropout_rate, training=self.training)
+        if return_alpha:
+            h3, alpha_dict_3 = self.conv3(h2_drop, edge_index, return_alpha=True)
+        else:
+            h3 = self.conv3(h2_drop, edge_index)
+        h3 = h3 + self.eps * x_0
+        h3 = self.ln3(h3)
+        h3_out = F.gelu(h3)
 
         # Output Head
-        out = self.last_layer(h2_out) #NOTE: before was h3_out! OCIO if you want 3 layers instead of 2!!!!!
+        out = self.last_layer(h3_out) #NOTE: before was h3_out! OCIO if you want 3 layers instead of 2!!!!!
         
         # LeakyReLU during training to prevent dead gradients, hard ReLU for biological realism at eval
         if self.training:
