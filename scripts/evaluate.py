@@ -93,10 +93,16 @@ def plot_results(results: dict, metric: str):
     
     models = list(results.keys())
     values = [list(results[key].values()) for key in models]
-    
-    bp = ax.boxplot(values, patch_artist=True)
+
+    means = [np.mean(v) for v in values]
+    stds = [np.std(v, ddof=1) for v in values]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
     cmap = plt.cm.viridis  # you can choose others: plasma, coolwarm, etc.
     colors = cmap(np.linspace(0, 1, len(models)))
+    ax.bar(models, means, yerr=stds, capsize=5, ecolor='black', color=colors)
+    #bp = ax.boxplot(values, patch_artist=True, showfliers=False, showmeans=True)
+
     for patch, color in zip(bp['boxes'], colors):
         patch.set_facecolor(color)
     ax.set_xticklabels(models, rotation=45)
