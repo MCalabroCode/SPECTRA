@@ -16,8 +16,8 @@ class VariationalGraphEncoder(torch.nn.Module):
         if conv_type == 'FAGCN':
             self.conv1 = DirFAGCNConv(out_channels)
             self.conv2 = DirFAGCNConv(out_channels)
-            self.conv_mu = DirFAGCNConv(out_channels)
-            self.conv_logstd = DirFAGCNConv(out_channels)
+            #self.conv_mu = DirFAGCNConv(out_channels)
+            #self.conv_logstd = DirFAGCNConv(out_channels)
         elif conv_type == 'ChebConv':
             self.conv1 = ChebConv(in_channels, out_channels, K=2)
             self.conv2 = ChebConv(out_channels, out_channels, K=2)
@@ -60,14 +60,17 @@ class VariationalGraphEncoder(torch.nn.Module):
         x_drop = F.dropout(x_2, p=self.dropout_rate, training=self.training)
         
         # Calculate mu and logstd
-        mu = self.conv_mu(x_drop, edge_index)
-        mu = mu + self.eps * h_0
-        mu = self.proj_mu(mu)  # Final projection to out_channels
+        # mu = self.conv_mu(x_drop, edge_index)
+        # mu = mu + self.eps * h_0
+        # mu = self.proj_mu(mu)  # Final projection to out_channels
         
-        logst = self.conv_logstd(x_drop, edge_index)
-        logst = logst + self.eps * h_0
-        logst = self.proj_logstd(logst) # Final projection to out_channels
+        # logst = self.conv_logstd(x_drop, edge_index)
+        # logst = logst + self.eps * h_0
+        # logst = self.proj_logstd(logst) # Final projection to out_channels
         
+        mu = self.proj_mu(x_drop)
+        logst = self.proj_logstd(x_drop)
+
         return mu, logst
 
 class FeatureDecoder(torch.nn.Module):
@@ -300,29 +303,34 @@ class SPECTRA(torch.nn.Module):
         z_pert = self.reparametrize(mu_pert, logstd_pert, eps)
 
         if return_attention_weights:
-            y_hat, (alpha_dict_1, alpha_dict_2) = self.gex_decoder(z_pert, edge_index_batch, return_alpha=True)
+            y_hat, (alpha_dict_1, alpha_dict_2, alpha_dict_3) = self.gex_decoder(z_pert, edge_index_batch, return_alpha=True)
 
-            # Grab the incoming gating weights for Layer 1 and 2
-            alpha_L1_batched = alpha_dict_1['alpha_in'] # Shape: [B * E]
-            alpha_L2_batched = alpha_dict_2['alpha_in'] # Shape: [B * E]
+            # # Grab the incoming gating weights for Layer 1 and 2
+            # alpha_L1_batched = alpha_dict_1['alpha_in'] # Shape: [B * E]
+            # alpha_L2_batched = alpha_dict_2['alpha_in'] # Shape: [B * E]
+            # alpha_L3_batched = alpha_dict_3['alpha_in']
 
-            E = self.edge_index.shape[1]
+            # E = self.edge_index.shape[1]
 
-            # 4. MEMORY-EFFICIENT BATCH AVERAGING
-            alpha_L1_average = alpha_L1_batched.reshape(batch_size, E).mean(dim=0)
-            alpha_L2_average = alpha_L2_batched.reshape(batch_size, E).mean(dim=0)
+            # # 4. MEMORY-EFFICIENT BATCH AVERAGING
+            # alpha_L1_average = alpha_L1_batched.reshape(batch_size, E).mean(dim=0)
+            # alpha_L2_average = alpha_L2_batched.reshape(batch_size, E).mean(dim=0)
+            # alpha_L3_average = alpha_L3_batched.reshape(batch_size, E).mean(dim=0)
 
-            # 5. BUILD MATRICES AND MULTIPLY
-            N = self.num_nodes
             
-            # Using self.edge_index (which is safely on self.device)
-            A_L1 = torch.sparse_coo_tensor(self.edge_index, alpha_L1_average, (N, N)).to_dense()
-            A_L2 = torch.sparse_coo_tensor(self.edge_index, alpha_L2_average, (N, N)).to_dense()
-
-            # The Aggregate Attention Graph
-            A_Agg = torch.matmul(A_L2, A_L1)
+            # # 5. BUILD MATRICES AND MULTIPLY
+            # N = self.num_nodes
             
-            return A_Agg, y_hat, x_hat
+            # # Using self.edge_index (which is safely on self.device)
+            # A_L1 = torch.sparse_coo_tensor(self.edge_index, alpha_L1_average, (N, N)).to_dense()
+            # A_L2 = torch.sparse_coo_tensor(self.edge_index, alpha_L2_average, (N, N)).to_dense()
+            # A_L3 = torch.sparse_coo_tensor(self.edge_index, alpha_L3_average, (N, N)).to_dense() # let's hope in jesus
+
+            # # The Aggregate Attention Graph
+            # #A_Agg = torch.matmul(A_L3, torch.matmul(A_L2, A_L1))
+            # A_Agg = A_L1 @ A_L2 @ A_L3
+            
+            return y_hat, x_hat, (alpha_dict_1, alpha_dict_2, alpha_dict_3)
 
         else:
             y_hat = self.gex_decoder(z_pert, edge_index_batch)
@@ -344,7 +352,7 @@ class SPECTRA(torch.nn.Module):
         edge_index_batch = self._get_batched_edge_index(batch_size)
         pert = pert.reshape(batch_size * num_nodes) 
 
-        # 1. ENCODER PASS
+        # ENCODER PASS
         gene_ids = self._get_batched_gene_ids(batch_size) 
         scgpt_base = self.gene_embeddings(gene_ids) 
         x_flat = x.reshape(batch_size * num_nodes, 1) 
@@ -355,7 +363,7 @@ class SPECTRA(torch.nn.Module):
         mu, logstd = self.encoder(x_node_features, edge_index_batch) 
         logstd = torch.clamp(logstd, min=-20, max=10) 
 
-        # 2. PERTURBATION INJECTION
+        # PERTURBATION INJECTION
         pert_mask = pert.bool()
         delta_mu = torch.zeros_like(mu)
         if pert_mask.any():
@@ -367,31 +375,124 @@ class SPECTRA(torch.nn.Module):
         mu_pert = mu + delta_mu
         z_pert = self.reparametrize(mu_pert, logstd)
         
-        # 3. DECODER PASS (Extracting Alphas)
-        _, (alpha_dict_1, alpha_dict_2) = self.gex_decoder(z_pert, edge_index_batch, return_alpha=True)
-        
+        # DECODER PASS (Extracting Alphas)
+        _, (alpha_dict_1, alpha_dict_2, alpha_dict_3) = self.gex_decoder(z_pert, edge_index_batch, return_alpha=True)
+    
         # Grab the incoming gating weights for Layer 1 and 2
-        alpha_L1_batched = alpha_dict_1['alpha_in'] # Shape: [B * E]
-        alpha_L2_batched = alpha_dict_2['alpha_in'] # Shape: [B * E]
+        alpha_L1_batched = alpha_dict_1['alpha_out'] # Shape: [B * E]
+        alpha_L2_batched = alpha_dict_2['alpha_out'] # Shape: [B * E]
+        alpha_L3_batched = alpha_dict_3['alpha_out']
 
         E = self.edge_index.shape[1]
 
-        # 4. MEMORY-EFFICIENT BATCH AVERAGING
+        # MEMORY-EFFICIENT BATCH AVERAGING
         alpha_L1_average = alpha_L1_batched.reshape(batch_size, E).mean(dim=0)
         alpha_L2_average = alpha_L2_batched.reshape(batch_size, E).mean(dim=0)
+        alpha_L3_average = alpha_L3_batched.reshape(batch_size, E).mean(dim=0)
 
-        # 5. BUILD MATRICES AND MULTIPLY
+        # BUILD MATRICES AND MULTIPLY
         N = self.num_nodes
         
         # Using self.edge_index (which is safely on self.device)
         A_L1 = torch.sparse_coo_tensor(self.edge_index, alpha_L1_average, (N, N)).to_dense()
         A_L2 = torch.sparse_coo_tensor(self.edge_index, alpha_L2_average, (N, N)).to_dense()
+        A_L3 = torch.sparse_coo_tensor(self.edge_index, alpha_L3_average, (N, N)).to_dense() # let's hope in jesus
 
         # The Aggregate Attention Graph
-        A_Agg = torch.matmul(A_L2, A_L1)
+        A_Agg = torch.matmul(A_L3, torch.matmul(A_L2, A_L1))
         
         return A_Agg, A_L1, A_L2
     
     def predict_full_expression(self, data):
         self.eval()
         return self.forward(data)[0]
+
+
+
+    @torch.no_grad()
+    def downstream_A_from_alpha(edge_index, alpha, N, edge_weight=None):
+        """
+        Builds A[src, dst] for original directed edges src -> dst.
+        This is row-source / column-target convention.
+        """
+        src, dst = edge_index
+
+        deg_in = torch.bincount(dst, minlength=N).float().clamp_min(1.0).to(alpha.device)
+
+        vals = alpha / deg_in[dst]
+
+        if edge_weight is not None:
+            vals = vals * edge_weight.to(alpha.device)
+
+        A = torch.sparse_coo_tensor(
+            torch.stack([src, dst]),
+            vals,
+            (N, N),
+            device=alpha.device
+        ).to_dense()
+
+        return A
+
+    @torch.no_grad()
+    def compute_downstream_path_matrix(self, x, pert):
+        y_hat, x_hat, (a1, a2, a3) = self.forward((x, pert), return_attention_weights=True)
+
+        B = pert.shape[0]
+        N = self.num_nodes
+        E = self.edge_index.shape[1]
+
+        alpha1 = a1["alpha_in"].view(B, E)
+        alpha2 = a2["alpha_in"].view(B, E)
+        alpha3 = a3["alpha_in"].view(B, E)
+
+        A_sum = torch.zeros(N, N, device=self.device)
+
+        for b in range(B):
+            A1 = self.downstream_A_from_alpha(self.edge_index, alpha1[b], N)
+            A2 = self.downstream_A_from_alpha(self.edge_index, alpha2[b], N)
+            A3 = self.downstream_A_from_alpha(self.edge_index, alpha3[b], N)
+
+            # row = origin gene, col = destination gene
+            A_sum += A1 @ A2 @ A3
+
+        A_Agg = A_sum / B
+        return A_Agg, y_hat, x_hat
+
+    @torch.no_grad()
+    def compute_downstream_path_matrices(self, x, pert):
+        self.eval()
+
+        y_hat, x_hat, (a1, a2, a3) = self.forward(
+            (x, pert),
+            return_attention_weights=True
+        )
+
+        B = pert.shape[0]
+        N = self.num_nodes
+        E = self.edge_index.shape[1]
+
+        alpha1 = a1["alpha_in"].view(B, E)
+        alpha2 = a2["alpha_in"].view(B, E)
+        alpha3 = a3["alpha_in"].view(B, E)
+
+        A1_sum = torch.zeros(N, N, device=self.device)
+        A12_sum = torch.zeros(N, N, device=self.device)
+        A123_sum = torch.zeros(N, N, device=self.device)
+
+        for b in range(B):
+            A1 = downstream_A_from_alpha(self.edge_index, alpha1[b], N)
+            A2 = downstream_A_from_alpha(self.edge_index, alpha2[b], N)
+            A3 = downstream_A_from_alpha(self.edge_index, alpha3[b], N)
+
+            A12 = A1 @ A2
+            A123 = A12 @ A3
+
+            A1_sum += A1
+            A12_sum += A12
+            A123_sum += A123
+
+        return {
+            "one_hop": A1_sum / B,
+            "two_hops": A12_sum / B,
+            "three_hops": A123_sum / B
+        }, y_hat, x_hat

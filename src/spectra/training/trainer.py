@@ -326,6 +326,15 @@ def train(model,
     accumulation_steps = 1
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, fused=True, weight_decay=0.0)
 
+    # for FAGCN convolution, pre-calculated in-degree, out-degree and reverse edge index
+    if model.conv_type == 'FAGCN':
+        _precompute_n = batch_size * model.num_nodes
+        _precompute_edge = model._get_batched_edge_index(batch_size)
+        for _module in model.modules():
+            if hasattr(_module, 'precompute_degrees'):
+                _module.precompute_degrees(_precompute_edge, _precompute_n)
+
+
     weights_dir = '/scratch/michele.calabro/gears/VCC/SPECTRA/weights'
     os.makedirs(weights_dir, exist_ok=True)
 

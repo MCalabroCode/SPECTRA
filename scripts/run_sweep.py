@@ -48,7 +48,6 @@ def load_all_data(config):
 
     with open(config['data']['scgpt_embeddings_path'], "rb") as f:
         scgpt_dict = pickle.load(f)
-    scgpt_genes = set(scgpt_dict.keys())
 
     # # load gene list (optional)
     # print("Loading gene list...")
@@ -63,6 +62,7 @@ def load_all_data(config):
     G = nx.DiGraph()
     for _, edge in network_data.iterrows():
         G.add_edge(edge['source'], edge['target'], weight=edge['weight'])
+    G.remove_nodes_from([n for n in G.nodes if n not in scgpt_dict])
     grn_genes = set(G.nodes)
     num_nodes = G.number_of_nodes()
     num_edges = G.number_of_edges()
@@ -158,7 +158,7 @@ def sweep_train():
         train(
             model=model, 
             train_loader=train_loader, 
-            test_loader=test_loader,
+            test_loader=val_loader,
             lr=combined_config['lr'], 
             n_epochs=combined_config['n_epochs'],  
             device=device,

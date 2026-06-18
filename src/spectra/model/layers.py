@@ -75,6 +75,11 @@ class DirFAGCNConv(MessagePassing):
         self.channels = channels
         self.alpha = alpha
 
+        self._cached_deg_in = None
+        self._cached_deg_out = None
+        self._cached_reverse_edge = None
+
+        # shared convolutional kernel g (see paper)
         if share_gates:
             gate = nn.Linear(2 * channels, 1, bias=False)
             self.gate_in = gate
@@ -84,6 +89,12 @@ class DirFAGCNConv(MessagePassing):
             self.gate_out = nn.Linear(2 * channels, 1, bias=False)
 
         self.reset_parameters()
+
+    def precompute_degrees(self, edge_index, num_nodes):
+        src, dst = edge_index[0], edge_index[1]
+        self._cached_reverse_edge = edge_index.flip(0)
+        self._cached_deg_in  = degree(dst, num_nodes=num_nodes, dtype=torch.float).clamp(min=1.0)
+        self._cached_deg_out = degree(src, num_nodes=num_nodes, dtype=torch.float).clamp(min=1.0)
 
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.gate_in.weight)
@@ -117,9 +128,18 @@ class DirFAGCNConv(MessagePassing):
         num_nodes = x.size(0)
         src, dst = edge_index[0], edge_index[1]
 
-        # Directed degrees on the graph:
-        deg_in = degree(dst, num_nodes=num_nodes, dtype=x.dtype).clamp(min=1.0)
-        deg_out = degree(src, num_nodes=num_nodes, dtype=x.dtype).clamp(min=1.0)
+        # # Directed degrees on the graph:
+        # deg_in = degree(dst, num_nodes=num_nodes, dtype=x.dtype).clamp(min=1.0)
+        # deg_out = degree(src, num_nodes=num_nodes, dtype=x.dtype).clamp(min=1.0)
+
+        # cached data
+        if self._cached_deg_in is not None:
+            deg_in, deg_out = self._cached_deg_in, self._cached_deg_out
+            rev_edge_index = self._cached_reverse_edge
+        else:
+            deg_in  = degree(dst, num_nodes=num_nodes, dtype=x.dtype).clamp(min=1.0)
+            deg_out = degree(src, num_nodes=num_nodes, dtype=x.dtype).clamp(min=1.0)
+            rev_edge_index = edge_index.flip(0)
 
         # Pre-calculate gates to avoid massive torch.cat: W[h_i || h_j] = W_ih_i + W_jh_j
         w_in_i = self.gate_in.weight[:, :self.channels]
@@ -145,7 +165,7 @@ class DirFAGCNConv(MessagePassing):
 
         # Outgoing aggregation: this is equivalent to propagating on reversed edges k -> i.
         #rev_edge_index = torch.stack([dst, src], dim=0)
-        rev_edge_index = edge_index.flip(0)
+        #rev_edge_index = edge_index.flip(0)
 
         w_out_i = self.gate_out.weight[:, :self.channels]
         w_out_j = self.gate_out.weight[:, self.channels:]
