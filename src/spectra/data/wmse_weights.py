@@ -79,7 +79,7 @@ def compute_degs(adata, mode='vsrest', pval_threshold=0.05):
     
     return adata_subset.uns['rank_genes_groups']
 
-def compute_weights(adata, gene_to_idx, cells_per_pert=256, score_type = 'scores', power=2.5):
+def compute_weights(adata, gene_to_idx, cells_per_pert=256, score_type = 'scores', power=2.2):
     '''
     For each perturbation, downsample to the number of cells in DATASET_CELL_COUNTS
     Then calculate the DEGs vs rest

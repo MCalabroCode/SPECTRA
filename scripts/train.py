@@ -17,7 +17,7 @@ from spectra.utils import set_seed
 from spectra.data import data_preprocessing, build_model_dataloaders_perts_split, compute_weights
 from spectra.model import SPECTRA
 from spectra.training import train
-
+from spectra.data import build_model_dataloaders_from_perts_list
 
 def main(config):
 
@@ -110,7 +110,7 @@ def main(config):
     model_config['dataset_size'] = adata.shape[0]
     model_config['pert_to_idx'] = {pert: i for i, pert in enumerate(perturbations)}
     
-    train_loader, val_loader, test_loader, _, _, _, _, _, _ = build_model_dataloaders_perts_split(adata, model_config)
+    train_loader, val_loader, test_loader, _, _, _, _, _, _ = build_model_dataloaders_from_perts_list(adata, model_config, '/scratch/michele.calabro/gears/VCC/SPECTRA/data/vcc_4/VCC_4_split_indices.json')
 
     # Load WMSE Weights
     print('Building DEGs weights...')

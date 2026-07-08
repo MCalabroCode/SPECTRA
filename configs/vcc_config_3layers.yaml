@@ -1,5 +1,5 @@
 project:
-  name: "SPECTRA_vcc_3layers"
+  name: "SPECTRA_vcc_FINAL"
   seed: 42
   deterministic: False
   use_wandb: True
@@ -7,12 +7,12 @@ project:
 data:
   adata_path: "/scratch/michele.calabro/gears/VCC/SPECTRA/data/adata_vcc.h5ad"
   gene_list_path: "/scratch/michele.calabro/gears/VCC/SPECTRA/data/gene_list-vcc.txt"
-  network_path: "/scratch/michele.calabro/gears/VCC/SPECTRA/data/FUNGI_new_vcc.tsv"
+  network_path: "/scratch/michele.calabro/gears/VCC/SPECTRA/data/vcc_4/VCC_4_chitin.tsv"
   scgpt_embeddings_path: "/scratch/michele.calabro/gears/VCC/SPECTRA/data/scGPT_embeddings_all_genes.pkl"
   gene_weights_path: "/scratch/michele.calabro/gears/VCC/SPECTRA/data/gene_weights-vcc.pkl"
 
 model:
-  architecture: "reduced_encoder"
+  architecture: "vcc_final"
   conv_type: 'FAGCN'
   residual_weight: 0.7
   n_channels: 64

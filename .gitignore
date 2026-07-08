@@ -18,6 +18,7 @@
 /scgpt
 /obsolete
 /temp
+/scLambda
 __pycache__/
 *.pth
 

@@ -497,6 +497,8 @@ def _core_common_degs(adata_sub, top_n=100):
     # 3. Calculate Overlap
     if len(top_true_degs) == 0:
         return 0.0
+
+    # NOTE: this is recall score; to have precision: return round(len(top_true_degs.intersection(top_pred_degs)) / len(top_pred_degs), 4)
     return round(len(top_true_degs.intersection(top_pred_degs)) / len(top_true_degs), 4)
 
 # End-User Functions - to be called directly
