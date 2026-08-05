@@ -43,7 +43,7 @@ def compute_degs(adata, mode='vsrest', pval_threshold=0.05):
     sc.tl.rank_genes_groups(
         adata_subset, 
         'target_gene', 
-        method='t-test_overestim_var',
+        method='wilcoxon',#t-test_overestim_var
         reference=reference, 
         use_raw=False   
     )
@@ -79,7 +79,7 @@ def compute_degs(adata, mode='vsrest', pval_threshold=0.05):
     
     return adata_subset.uns['rank_genes_groups']
 
-def compute_weights(adata, gene_to_idx, cells_per_pert=256, score_type = 'scores', power=2.2):
+def compute_weights(adata, gene_to_idx, cells_per_pert=256, score_type = 'scores', power=2.5):
     '''
     For each perturbation, downsample to the number of cells in DATASET_CELL_COUNTS
     Then calculate the DEGs vs rest
@@ -99,8 +99,8 @@ def compute_weights(adata, gene_to_idx, cells_per_pert=256, score_type = 'scores
     adata_n_cells = []
     unique_perts = adata.obs['target_gene'].unique()
     for pert in unique_perts:
-        if pert == 'non-targeting': 
-            continue 
+        # if pert == 'non-targeting': 
+        #     continue 
 
         # cell indices    
         pert_idx = adata.obs_names[adata.obs['target_gene'] == pert]

@@ -311,16 +311,6 @@ def calc_auprc(adata_true, adata_pred, pert_col='target_gene', control_name='non
         
         # Calculate Baseline AUPRC (Number of DEGs / Total Genes)
         baseline_results[pert] = np.sum(Z_true) / len(Z_true)
-        
-        # results.append({
-        #     'perturbation': pert,
-        #     'num_true_degs': np.sum(Z_true),
-        #     'baseline_auprc': baseline_auprc,
-        #     'model_auprc': model_auprc
-        # })
-        
-    # # --- D. SUMMARIZE RESULTS ---
-    # df_results = pd.DataFrame(results)
     
     print("\n--- Summary ---")
     print(f"Average Baseline AUPRC: {sum(baseline_results.values())/len(baseline_results):.4f}")
@@ -389,6 +379,8 @@ def evaluate_metric_per_perturbation(adata_true, adata_pred, metric_func, contro
     """
     General wrapper that runs a given metric function for each individual perturbation.
     """
+
+    # new column "Expcategory" in .obs: "control" for control cells, 'stimulated' for gt, 'imputed' for predictions  
     adata_merged = prepare_merged_adata(adata_true, adata_pred, control_tag, condition_col)
     
     # Get all unique perturbations (excluding the control tag)
@@ -424,7 +416,11 @@ def evaluate_metric_per_perturbation(adata_true, adata_pred, metric_func, contro
             
             # Subset the working object to only these top N genes
             adata_sub = adata_sub[:, top_true_degs].copy()
-            
+        
+        # # except for DEGs overlap metrics we remove control cells (casuse they are they are always the ground truth)
+        # if metric_func not in ['_core_common_degs']:
+        #     adata_sub = adata_sub[adata_sub.obs['Excategory']!='control']
+
         # Calculate metric
         with SuppressOutput():
             score = metric_func(adata_sub, **kwargs)
@@ -477,7 +473,7 @@ def _core_kldiv(adata_sub, do_subsample=True):
     pairwise_df = Distance.onesided_distances(adata_sub, groupby="Expcategory", selected_group='imputed', groups=["stimulated"])
     return round(np.log2(pairwise_df['stimulated'] + 1), 4)
 
-def _core_common_degs(adata_sub, top_n=100):
+def _core_common_degs(adata_sub, top_n=50):
     adata_sub.obs['Expcategory'] = adata_sub.obs['Expcategory'].astype('category')
     
     # 1. Identify True DEGs for this specific perturbation
