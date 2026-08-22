@@ -42,20 +42,23 @@ SPECTRA/
 ## ⚙️ Installation
 
 1. **Clone the repository (NOTE: not available yet! Just copy the files):**
+
 ```bash
 git clone https://github.com/MCalabroCode/SPECTRA.git
 cd SPECTRA
 ```
 
 2. **Create and activate a virtual environment**:
+
 ```bash
-conda create -n spectra_env python=3.11
-conda activate spectra_env
+python3.11 -m venv spectra_venv
+source spectra_venv/bin/activate
 ```
 
 3. **Install the package locally:**
+
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 pip install -e .
 ```
 
@@ -81,8 +84,11 @@ python scripts/run_sweep.py --config configs/sweep_config.yaml --count 10
 ## 📊 Evaluation & Inference
 
 ### 1. Interactive Inference
+
 To load a pre-trained model and test predictions interactively, check out the provided Jupyter Notebook `notebooks/spectra_testing.ipynb`
+
 ### 2. Full Benchmark Pipeline
+
 To evaluate SPECTRA against baselines across multiple metrics, use the `benchmark.py` script. Ensure that your ground-truth data (e.g., `real_adata.h5ad`) and generated predictions (e.g., `pred_adata-<model_name>.h5ad`) are available.
 
 ```bash
