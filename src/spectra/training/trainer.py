@@ -22,7 +22,6 @@ from spectra.training.losses import _get_beta_schedule, compute_mmd_withcosine, 
 def train_step_perturb_model(model, data, device, alpha=1., beta=1., gamma=1., eta=1.):
     x, y, pert, pert_idx = data  # x,y: [B,N,1], pert: [B,N]
     x, y, pert = x.to(device), y.to(device), pert.to(device)
-
     B, N, _ = x.shape
 
     y_hat, x_hat = model((x,pert)) #[BxN,1]
@@ -62,25 +61,24 @@ def train_step_perturb_model(model, data, device, alpha=1., beta=1., gamma=1., e
         loss_cosine = torch.tensor(0.0, device=device)
     
     #loss_mmd_y = compute_mmd_withcosine(y_true, y_pred, weights=batch_weights)
-    loss_wmse_y = torch.sum(batch_weights * (y_true_mean - y_pred_mean)**2)
+
+    # loss_wmse_y = torch.sum(batch_weights * (y_true_mean - y_pred_mean)**2)
 
     loss_mmd_y = compute_weighted_energy_distance(y_true, y_pred, batch_weights)
 
-    loss_mmd_x = torch.tensor(0.0, device=device)
     # if mmd_gamma != 0.0:
     #     loss_mmd_x = compute_mmd(x_true, x_pred)
     # else:
     #     loss_mmd_x = 0.0
-    
+
     total_loss = (alpha * control_loss_feat 
                 + beta * kl_div 
                 + gamma * loss_mmd_y 
-                + eta * loss_wmse_y
+                # + eta * loss_wmse_y
                 + loss_cosine
     )
 
-    return total_loss, loss_mmd_y, loss_mmd_x, kl_div, loss_cosine, control_loss_feat
-
+    return total_loss, kl_div, loss_mmd_y, loss_cosine, control_loss_feat
 
 @torch.no_grad()
 def test_perturb_model(model, loader, device):
@@ -293,17 +291,11 @@ def test_perturb_model_new(model, loader, device, var_names, idx_to_gene):
 def train(model, 
     train_loader, 
     test_loader, 
-    lr, 
-    n_epochs, 
     device, 
     wandb_support, 
     var_names, 
     idx_to_gene, 
-    alpha_weight, 
-    beta_weight,
-    gamma_weight,
-    eta_weight,
-    patience=8, 
+    patience=7, 
     metric_mode='min'
 ):
     """
@@ -313,10 +305,16 @@ def train(model,
 
     torch.autograd.set_detect_anomaly(True)
 
+    # estract hyperparameters from model.config
+    lr = model.config['lr']
+    n_epochs = model.config['n_epochs'] 
+    alpha_weight = model.config['alpha'] 
+    beta_weight = model.config['beta'] 
+    gamma_weight = model.config['gamma'] 
+
     global_loss = []
     mmd_pert = []
     mmd_ctrl = []
-
     test_wmse = []
     test_mmd = []
 
@@ -335,7 +333,7 @@ def train(model,
                 _module.precompute_degrees(_precompute_edge, _precompute_n)
 
 
-    weights_dir = '/scratch/michele.calabro/gears/VCC/SPECTRA/weights'
+    weights_dir = model.config['weights_folder_path']
     os.makedirs(weights_dir, exist_ok=True)
 
     # Early Stopping Setup
@@ -362,21 +360,20 @@ def train(model,
 
         optimizer.zero_grad(set_to_none=True)
         for (i,batch) in enumerate(tqdm(train_loader, desc=f'training at epoch {epoch}')):
-            loss, loss_mmd_y, loss_mmd_x, kl_div, loss_cosine, loss_feat = train_step_perturb_model(
+            loss, kl_div, loss_mmd_y, loss_cosine, loss_feat = train_step_perturb_model(
                 model, 
                 batch, 
                 model.device, 
                 alpha=alpha_weight, 
                 beta=beta_weight,
-                gamma=gamma_weight,
-                eta=eta_weight)
-            
+                gamma=gamma_weight)
+
             loss.backward()
 
             # sum, we will calculate the mean over all the epoch
             total_loss += loss.item()
             total_mmd_pert += loss_mmd_y.item()
-            total_mmd_ctrl += loss_mmd_x#.item()
+            #total_mmd_ctrl += loss_mmd_x#.item()
             kl_accum += kl_div.item()
             mse_accum += loss_feat.item()
             cos_accum += loss_cosine.item()
@@ -389,7 +386,7 @@ def train(model,
         # calculate averages for the epoch
         epoch_loss = total_loss / len(train_loader)
         epoch_mmd_pert = total_mmd_pert / len(train_loader)
-        epoch_mmd_ctrl = total_mmd_ctrl / len(train_loader)
+        #epoch_mmd_ctrl = total_mmd_ctrl / len(train_loader)
         epoch_kl = kl_accum / len(train_loader)
         epoch_mse = mse_accum / len(train_loader)
         epoch_cos = cos_accum / len(train_loader)
@@ -397,7 +394,7 @@ def train(model,
         # Append to lists
         global_loss.append(epoch_loss)
         mmd_pert.append(epoch_mmd_pert)
-        mmd_ctrl.append(epoch_mmd_ctrl)
+        #mmd_ctrl.append(epoch_mmd_ctrl)
 
         # print training methods
         print(f'training KL = {epoch_kl:.5f} | mse = {epoch_mse:.3f} | cos = {epoch_cos:.3f}')
@@ -432,7 +429,7 @@ def train(model,
                     "epoch": epoch,
                     "train/global_loss": epoch_loss,
                     "train/mmd_pert": epoch_mmd_pert,
-                    "train/mmd_ctrl": epoch_mmd_ctrl,
+                    # "train/mmd_ctrl": epoch_mmd_ctrl,
                     "train/kl_divergence": epoch_kl,
                     "train/mse": epoch_mse,
                     "train/cosine_loss": epoch_cos,

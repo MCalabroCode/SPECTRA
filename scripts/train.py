@@ -14,7 +14,7 @@ import os
 warnings.filterwarnings("ignore")
 
 from spectra.utils import set_seed
-from spectra.data import data_preprocessing, build_model_dataloaders_perts_split, compute_weights
+from spectra.data import data_preprocessing, build_model_dataloaders_perts_split, compute_weights, compute_weights_enhanced
 from spectra.model import SPECTRA
 from spectra.training import train
 from spectra.data import build_model_dataloaders_from_perts_list
@@ -37,9 +37,9 @@ def main(config):
     # Load Data using paths from config
     print("Loading datasets and embeddings...")
     adata = sc.read_h5ad(config['data']['adata_path'])
-    adata = data_preprocessing(adata,
-        logtransform=True, 
-        min_cells_per_pert=50)
+    # adata = data_preprocessing(adata,
+    #     logtransform=True, 
+    #     min_cells_per_pert=50)
 
     with open(config['data']['scgpt_embeddings_path'], "rb") as f:
         scgpt_dict = pickle.load(f)
@@ -60,16 +60,17 @@ def main(config):
         G.add_edge(edge['source'], edge['target'], weight=edge['weight'])
     G.remove_nodes_from([n for n in G.nodes if n not in scgpt_dict])
     grn_genes = set(G.nodes)
-    num_nodes = G.number_of_nodes()
-    num_edges = G.number_of_edges()
-    print("Number of nodes:", num_nodes)
-    print("Number of edges:", num_edges)
 
     # Filter adata to match final network genes
     gene_list = grn_genes & set(adata.var_names)
     if grn_genes != gene_list:
         print('WARNING: some genes in the provided gene list are not included in the grn, or the gene embeddings are missing; filtering them out...')
     adata = adata[:, adata.var_names.isin(gene_list)]
+    G = G.subgraph(gene_list).copy()
+    num_nodes = G.number_of_nodes()
+    num_edges = G.number_of_edges()
+    print("Number of nodes:", num_nodes)
+    print("Number of edges:", num_edges)
 
     # Filter out perturbations that aren't in the gene list
     perturbations = list(adata.obs['target_gene'].unique())
@@ -79,13 +80,11 @@ def main(config):
         if any(single_pert not in gene_list for single_pert in pert.split('+'))
     })
     if len(perts_not_included)>0:
-        print(print('WARNING: some perturbed genes are not included in the GRN. Filtering these perturbation samples out...'))
+        print('WARNING: some perturbed genes are not included in the GRN. Filtering these perturbation samples out...')
     adata = adata[~adata.obs['target_gene'].isin(perts_not_included)].copy()
 
-    # Shuffle adata, dataset and network genes sanity check
-    adata = adata[np.random.permutation(adata.n_obs), :]
+    # sanity check
     assert set(G.nodes) == set(adata.var_names), "Nodes in G and adata.var_names differ!"
-
     print('=================')
 
     # Map Encodings & Edge Index
@@ -102,15 +101,14 @@ def main(config):
 
     # Build Dataloaders
     print("Building dataloaders...")
-    perturbations = list(adata.obs['target_gene'].unique())
-    perturbations.remove('non-targeting')
-    
+    perturbations = sorted(pert for pert in adata.obs["target_gene"].unique() if pert != "non-targeting")
+
     # Merge config dictionaries for the model/dataloaders
     model_config = {**config['model'], **config['training']}
     model_config['dataset_size'] = adata.shape[0]
     model_config['pert_to_idx'] = {pert: i for i, pert in enumerate(perturbations)}
     
-    train_loader, val_loader, test_loader, _, _, _, _, _, _ = build_model_dataloaders_from_perts_list(adata, model_config, '/scratch/michele.calabro/gears/VCC/SPECTRA/data/vcc_4/VCC_4_split_indices.json')
+    train_loader, val_loader, test_loader, _, _, _, _, _, _ = build_model_dataloaders_from_perts_list(adata, model_config, config['data']['split_path'])
 
     # Load WMSE Weights
     print('Building DEGs weights...')
@@ -121,7 +119,7 @@ def main(config):
             gene_weights = pickle.load(f)
     else:
         print('No gene weights dictionary found. Calculating...')
-        gene_weights = compute_weights(adata, gene_to_idx, cells_per_pert=256)
+        gene_weights = compute_weights_enhanced(adata, gene_to_idx, cells_per_pert=128)
         with open(weights_path, 'wb') as f:
             pickle.dump(gene_weights, f)
 
@@ -150,19 +148,14 @@ def main(config):
         model=model, 
         train_loader=train_loader, 
         test_loader=val_loader,
-        lr=model_config['lr'], 
-        n_epochs=model_config['n_epochs'],  
         device=device,
         wandb_support=wandb_support,
         var_names=adata.var_names.tolist(),
         idx_to_gene=idx_to_gene,
-        alpha_weight=model_config['alpha'],
-        beta_weight=model_config['beta'],
-        gamma_weight=model_config['gamma'],
-        eta_weight=model_config['eta']
+        patience=7,
     )
 
-    weights_dir = "/scratch/michele.calabro/gears/VCC/SPECTRA/weights/finals"
+    weights_dir = config['training']['weights_folder_path']
     if wandb_support and wandb.run is not None:
         final_filepath = os.path.join(weights_dir,f"final_model_{model.architecture_name}_{wandb.run.id}.pth")
     else:

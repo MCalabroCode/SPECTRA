@@ -26,7 +26,7 @@ class SCDATA_sampler(Sampler):
         if ptb_name is None:
             ptb_name = data.ptb_names
 
-        for ptb in set(ptb_name):
+        for ptb in sorted(set(ptb_name)):
             idx = np.where(ptb_name == ptb)[0] # indices of cells with the same pert ptb
             self.intervindices.append(idx) # list of indices of cells with the same pert ptb
             self.len += len(idx) // batchsize # number of batches with pert ptb

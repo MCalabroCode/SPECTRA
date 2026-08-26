@@ -8,7 +8,6 @@ import numpy as np
 from tqdm import tqdm
 import pandas as pd
 
-# degs calculation
 def compute_degs(adata, mode='vsrest', pval_threshold=0.05):
     """
     Compute differentially expressed genes (DEGs) for each perturbation.
@@ -29,12 +28,10 @@ def compute_degs(adata, mode='vsrest', pval_threshold=0.05):
     """
 
     if mode == 'vsrest':
-        # Remove control cells for vsrest analysis
-        adata_subset = adata[adata.obs['target_gene'] != 'non-targeting'].copy()
+        adata_subset = adata[adata.obs['target_gene'] != 'non-targeting'].copy()    # Remove control cells for vsrest analysis
         reference = 'rest'
     elif mode == 'vscontrol':
-        # Use full dataset for vscontrol analysis
-        adata_subset = adata.copy()
+        adata_subset = adata.copy()     # Use full dataset for vscontrol analysis
         reference = 'non-targeting'
     else:
         raise ValueError("mode must be 'vsrest' or 'vscontrol'")
@@ -81,10 +78,6 @@ def compute_degs(adata, mode='vsrest', pval_threshold=0.05):
 
 def compute_weights(adata, gene_to_idx, cells_per_pert=256, score_type = 'scores', power=2.5):
     '''
-    For each perturbation, downsample to the number of cells in DATASET_CELL_COUNTS
-    Then calculate the DEGs vs rest
-    Save the selected cells inside the dictionary
-
     Args:
         adata: Anndata file
         gene_to_idx: dictionary that maps each gene to the corresponding index
@@ -101,11 +94,9 @@ def compute_weights(adata, gene_to_idx, cells_per_pert=256, score_type = 'scores
     for pert in unique_perts:
         # if pert == 'non-targeting': 
         #     continue 
-
-        # cell indices    
-        pert_idx = adata.obs_names[adata.obs['target_gene'] == pert]
         
         # If a pert has fewer cells than target, take all of them; otherwise downsample
+        pert_idx = adata.obs_names[adata.obs['target_gene'] == pert]    # cells indices 
         n_available = len(pert_idx)
         n_select = min(n_available, cells_per_pert)
         if n_select < n_available:
@@ -114,7 +105,7 @@ def compute_weights(adata, gene_to_idx, cells_per_pert=256, score_type = 'scores
             selected_cells = pert_idx
         adata_n_cells.append(adata[selected_cells])
 
-    # balanced dataset (NOTE: does not contain control)  
+    # balanced dataset
     adata_n_cells = sc.concat(adata_n_cells) 
 
     # Get DEGs vs rest
@@ -134,15 +125,13 @@ def compute_weights(adata, gene_to_idx, cells_per_pert=256, score_type = 'scores
         
         if max_val == min_val:
             if max_val == 0: 
-                # All scores are 0
-                normalized_weights = np.zeros_like(abs_scores)
+                normalized_weights = np.zeros_like(abs_scores) # All scores are 0
             else:
-                # All scores are the same non-zero value
-                normalized_weights = np.ones_like(abs_scores) 
+                normalized_weights = np.ones_like(abs_scores) # All scores are the same non-zero value
         else:
             normalized_weights = (abs_scores - min_val) / (max_val - min_val)
         
-        # Ensure no NaNs in weights, replace with 0 if any (e.g. if a gene had NaN score originally)
+        # Ensure no NaNs in weights, replace with 0 if any
         normalized_weights = np.nan_to_num(normalized_weights, nan=0.0)
         
         # Make weighting stronger by evalting by power the normalized weights
@@ -160,3 +149,144 @@ def compute_weights(adata, gene_to_idx, cells_per_pert=256, score_type = 'scores
 
     return final_weight_dict
 
+
+'''
+Wwighted Mean Squared Error logic inspired by: "Diversity by Design: Addressing Mode Collapse 
+Improves scRNA-seq Perturbation Modeling on Well-Calibrated Metrics", Miller et al.
+
+here, in respect with the original strategy that takes just the test z-scores, we multiply
+those for an effect-size gate to better highlight relative effects magnitude
+'''
+
+def compute_weights_enhanced(
+    adata,
+    gene_to_idx,
+    cells_per_pert=128,
+    power=2.0,
+    delta_threshold=0.25,
+    pval_threshold=0.01
+):
+    """
+    Compute WMSE weights using Scanpy Wilcoxon scores, modulated by
+    a soft mean-expression-difference gate.
+
+    For each perturbation and gene:
+
+        importance = abs(Wilcoxon score)   *   min(abs(mean_pert - mean_rest) / delta_threshold, 1)
+
+    Args:
+        adata:
+            AnnData object. adata.X should contain the same normalized expression representation used by the WMSE loss.
+
+        gene_to_idx:
+            Kept for compatibility with the original function.
+
+        cells_per_pert:
+            Maximum number of cells used per perturbation.
+
+        power:
+            Exponent used to strengthen the normalized weights.
+
+        delta_threshold:
+            Absolute mean-expression difference at which the gate
+            reaches 1. This is expressed in the same units as adata.X.
+
+    Returns:
+        Dictionary containing one weight vector per perturbation.
+    """
+
+    # Subsample at most cells_per_pert cells for each perturbation, 
+    # to create a more balanced dataset
+    adata_n_cells = []
+    unique_perts = adata.obs['target_gene'].unique()
+
+    for pert in unique_perts:
+
+        pert_idx = adata.obs_names[adata.obs['target_gene'] == pert]
+        n_cells_available = len(pert_idx)
+        n_selected_cells = min(n_cells_available, cells_per_pert)
+
+        if n_selected_cells < n_cells_available:
+            selected_cells = np.random.choice(
+                pert_idx,
+                size=n_selected_cells,
+                replace=False,
+            )
+        else:
+            selected_cells = pert_idx
+
+        adata_n_cells.append(adata[selected_cells])
+
+    adata_n_cells = sc.concat(adata_n_cells)
+
+    # Remove control cells explicitly ( we apply Wilcoxon comparison between perturbation vs all other perturbations.
+    adata_vsrest = adata_n_cells[adata_n_cells.obs['target_gene'] != 'non-targeting'].copy()
+
+    # Scanpy Wilcoxon test versus all other perturbations
+    curr_deg_results = compute_degs(adata_vsrest, mode='vsrest', pval_threshold=pval_threshold)
+    names_df_vsrest = pd.DataFrame(curr_deg_results['names'])
+    scores_df_vsrest = pd.DataFrame(curr_deg_results['scores'])
+
+    final_weight_dict = {}
+
+    for pert in tqdm(scores_df_vsrest.columns, desc='Calculating DEGs Weights',):
+
+        # Absolute Scanpy Wilcoxon scores
+        abs_scores = np.abs(scores_df_vsrest[pert].values.astype(float))
+        abs_scores = np.nan_to_num(abs_scores, nan=0.0, posinf=0.0, neginf=0.0) # nan handling
+
+        # Mean expression for perturbation and rest
+        pert_mask = (adata_vsrest.obs['target_gene'] == pert)
+        rest_mask = (adata_vsrest.obs['target_gene'] != pert)
+        pert_mean = np.asarray(adata_vsrest[pert_mask].X.mean(axis=0)).ravel()
+        rest_mean = np.asarray(adata_vsrest[rest_mask].X.mean(axis=0)).ravel()
+
+        # Absolute mean difference in the same space as adata.X
+        abs_mean_difference = np.abs(pert_mean - rest_mean)
+
+        # The mean differences are currently ordered as adata.var_names.
+        # Scanpy results are ordered by Wilcoxon ranking, so align them.
+        mean_difference_series = pd.Series(abs_mean_difference, index=adata_vsrest.var_names,)
+        ranked_genes = names_df_vsrest[pert].values
+        ranked_mean_difference = (mean_difference_series.reindex(ranked_genes).fillna(0.0).values)
+
+        # Soft mean-difference gate
+        mean_difference_gate = np.minimum(ranked_mean_difference / delta_threshold, 1.0)
+
+        # Combine statistical reliability and effect magnitude
+        combined_scores = (abs_scores * mean_difference_gate)
+
+        # Original min-max normalization
+        min_val = np.min(combined_scores)
+        max_val = np.max(combined_scores)
+        if max_val == min_val:
+            if max_val == 0:
+                normalized_weights = np.zeros_like(combined_scores)
+            else:
+                normalized_weights = np.ones_like(combined_scores)
+        else:
+            normalized_weights = (combined_scores - min_val) / (max_val - min_val)
+
+        normalized_weights = np.nan_to_num(normalized_weights, nan=0.0, posinf=0.0, neginf=0.0,)
+
+        # Strengthen the normalized weights
+        stronger_normalized_weights = (normalized_weights ** power)
+
+        # Normalize weights to sum to one
+        sum_weights = np.sum(stronger_normalized_weights)
+
+        if sum_weights > 0:
+            stronger_normalized_weights = (stronger_normalized_weights / sum_weights)
+        else:
+            # Safe fallback for a completely degenerate perturbation
+            stronger_normalized_weights = np.ones_like(
+                stronger_normalized_weights
+            ) / len(stronger_normalized_weights)
+
+        weights = pd.Series(stronger_normalized_weights, index=ranked_genes, name=pert)
+
+        # Restore original adata gene ordering
+        weights = weights.reindex(adata.var_names, fill_value=0.0)
+        final_weight_dict[pert] = weights.values
+
+    return final_weight_dict
