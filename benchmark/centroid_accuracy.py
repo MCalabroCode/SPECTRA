@@ -55,8 +55,10 @@ def calculate_centroid_accuracies(agg_post_pred_df, post_gt_all_df):
     scores = {}
     methods = agg_post_pred_df.index.get_level_values(1).unique()
     for method in methods:
-        x_df = dist_df.xs(method, level=1).sort_index()
-        y_df = self_distances_df.xs(method, level=1).sort_index()
+        # x_df = dist_df.xs(method, level=1).sort_index()
+        # y_df = self_distances_df.xs(method, level=1).sort_index()
+        x_df = dist_df.xs(method, level=1)
+        y_df = self_distances_df.xs(method, level=1)
         assert np.all(x_df.index == y_df.index)
         scores[method] = ((x_df > y_df.values).sum(axis=1)) / (x_df.shape[-1] - 1)
     scores_df = pd.DataFrame(scores)
