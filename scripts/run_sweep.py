@@ -42,9 +42,12 @@ def load_all_data(config):
     
     # Load Data
     adata = sc.read_h5ad(config['data']['adata_path'])
+
+    # NOTE: for vcc dataset, log-transform is requested. 
+    # NOTE: replogle already processed (replogle_preprocessing.ipynb)
     adata = data_preprocessing(adata,
-        logtransform=True, 
-        min_cells_per_pert=100)
+        logtransform=False, 
+        min_cells_per_pert=30)
 
     with open(config['data']['scgpt_embeddings_path'], "rb") as f:
         scgpt_dict = pickle.load(f)
@@ -64,16 +67,17 @@ def load_all_data(config):
         G.add_edge(edge['source'], edge['target'], weight=edge['weight'])
     G.remove_nodes_from([n for n in G.nodes if n not in scgpt_dict])
     grn_genes = set(G.nodes)
-    num_nodes = G.number_of_nodes()
-    num_edges = G.number_of_edges()
-    print("Number of nodes:", num_nodes)
-    print("Number of edges:", num_edges)
 
     # Filter adata to match final network genes
     gene_list = grn_genes & set(adata.var_names)
     if grn_genes != gene_list:
         print('WARNING: some genes in the provided gene list are not included in the grn, or the gene embeddings are missing; filtering them out...')
     adata = adata[:, adata.var_names.isin(gene_list)]
+    G = G.subgraph(gene_list).copy()
+    num_nodes = G.number_of_nodes()
+    num_edges = G.number_of_edges()
+    print("Number of nodes:", num_nodes)
+    print("Number of edges:", num_edges)
     
     # Filter out perturbations that aren't in the gene list
     perturbations = list(adata.obs['target_gene'].unique())
@@ -86,8 +90,7 @@ def load_all_data(config):
         print(print('WARNING: some perturbed genes are not included in the GRN. Filtering these perturbation samples out...'))
     adata = adata[~adata.obs['target_gene'].isin(perts_not_included)].copy()
 
-    # Shuffle
-    adata = adata[np.random.permutation(adata.n_obs), :]
+    # sanity check
     assert set(G.nodes) == set(adata.var_names), "Nodes in G and adata.var_names differ!"
 
     # Map Edge Index
@@ -102,8 +105,7 @@ def load_all_data(config):
     for gene_id, emb in scgpt_dict.items():
         embedding_matrix[gene_id] = torch.tensor(emb, dtype=torch.float32)
     
-    perturbations = list(adata.obs['target_gene'].unique())
-    perturbations.remove('non-targeting')
+    perturbations = sorted(pert for pert in adata.obs["target_gene"].unique() if pert != "non-targeting")
     pert_to_idx = {pert: i for i, pert in enumerate(perturbations)}
 
     return adata, edge_index, embedding_matrix, gene_to_idx, pert_to_idx, G.number_of_nodes()
@@ -126,9 +128,10 @@ def sweep_train():
         combined_config['dataset_size'] = GLOBAL_ADATA.shape[0]
         combined_config['pert_to_idx'] = GLOBAL_PERT_TO_IDX
         combined_config['num_node_features'] = 1 # Static parameter
+        combined_config['weights_folder_path'] = GLOBAL_BASE_CONFIG['data']['weights_folder_path']
 
         # Dataloaders
-        train_loader, val_loader, test_loader, _, _, _, _, _, _ = build_model_dataloaders_from_perts_list(GLOBAL_ADATA, combined_config, '/scratch/michele.calabro/gears/VCC/SPECTRA/data/VCC_h1_hESC_split_indices.json')
+        train_loader, val_loader, test_loader, _, _, _, _, _, _ = build_model_dataloaders_from_perts_list(GLOBAL_ADATA, combined_config, GLOBAL_BASE_CONFIG['data']['split_path'])
         # train_loader, val_loader, test_loader, _, _, _, _, _, _ = build_model_dataloaders_perts_split(GLOBAL_ADATA, combined_config)
         
         # WMSE Weights (Using the caching logic!)
@@ -159,16 +162,11 @@ def sweep_train():
             model=model, 
             train_loader=train_loader, 
             test_loader=val_loader,
-            lr=combined_config['lr'], 
-            n_epochs=combined_config['n_epochs'],  
             device=device,
             wandb_support=True,
             var_names=GLOBAL_ADATA.var_names.tolist(),
             idx_to_gene=idx_to_gene,
-            alpha_weight=combined_config['alpha'],
-            beta_weight=combined_config['beta'],
-            gamma_weight=combined_config['gamma'],
-            eta_weight=combined_config['eta']   
+            patience = 7
         )
 
 if __name__ == '__main__':
