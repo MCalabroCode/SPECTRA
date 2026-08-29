@@ -190,7 +190,7 @@ class SPECTRA(torch.nn.Module):
         #self.ko_mu = torch.nn.Embedding(num_nodes, 64)
         #self.ko_mlp = MLP([64, self.n_channels, self.n_channels])
         #self.ko_mlp = MLP([scgpt_dim, 2*self.n_channels, self.n_channels], dropout=0.1) 
-        self.ko_mlp = MLP([scgpt_dim, self.n_channels], dropout=0.0) 
+        self.ko_mlp = MLP([scgpt_dim, self.n_channels], batch_norm=False, dropout=0.0) 
 
         self.encoder = VariationalGraphEncoder(self.n_channels, self.n_channels, self.dropout_p, self.res, self.conv_type)
         self.gex_decoder = FeatureDecoder(self.n_channels, 1, self.dropout_p, self.res, self.conv_type)

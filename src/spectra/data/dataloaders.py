@@ -20,9 +20,12 @@ class SCDATA_sampler(Sampler):
     a special batch sampler that groups only cells from the same interventional distribution into a batch.
     From MORPH model: https://github.com/uhlerlab/MORPH/blob/main/morph/dataset.py
     '''
-    def __init__(self, data, batchsize, ptb_name=None):
+    def __init__(self, data, batchsize, ptb_name=None, shuffle=True):
         self.intervindices = []
         self.len = 0
+        self.shuffle = shuffle
+        self.batchsize = batchsize
+        
         if ptb_name is None:
             ptb_name = data.ptb_names
 
@@ -30,19 +33,24 @@ class SCDATA_sampler(Sampler):
             idx = np.where(ptb_name == ptb)[0] # indices of cells with the same pert ptb
             self.intervindices.append(idx) # list of indices of cells with the same pert ptb
             self.len += len(idx) // batchsize # number of batches with pert ptb
-        self.batchsize = batchsize
     
     def __iter__(self):
-        comb = []
-        # loop over each intervention
-        for i in range(len(self.intervindices)):
-            random.shuffle(self.intervindices[i]) # intra-Perturbation Shuffle
-            interv_batches = chunk(self.intervindices[i], self.batchsize)
-            if interv_batches:
-                comb += interv_batches
+        combined = []
 
-        combined = [batch.tolist() for batch in comb]
-        random.shuffle(combined) # shuffle the order of the batches
+        for original_indices in self.intervindices:
+            
+            # Important: do not modify the stored indices
+            indices = original_indices.copy()
+            if self.shuffle:
+                np.random.shuffle(indices)
+
+            batches = chunk(indices, self.batchsize)
+            if batches:
+                combined.extend(batch.tolist() for batch in batches)
+
+        if self.shuffle:
+            random.shuffle(combined)
+
         return iter(combined)
 
     def __len__(self):
@@ -62,8 +70,7 @@ def chunk(indices, chunk_size):
         return None
 
 class PerturbationDataset(Dataset):
-    def __init__(self, adata, gene_to_idx, pert_to_idx, start_idx=0, end_idx=None):
-        #TODO: edge_index can probably be removed
+    def __init__(self, adata, gene_to_idx, pert_to_idx, start_idx=0, end_idx=None, control_sampling="random", control_seed=42,):
         super().__init__()
 
         self.gene_to_idx = gene_to_idx
@@ -82,6 +89,13 @@ class PerturbationDataset(Dataset):
         if self.ctrl_samples.shape[0] == 0:
             raise ValueError("No control cells found in this dataset split!")
 
+        self.control_sampling = control_sampling
+        if control_sampling == "fixed":
+            rng = np.random.default_rng(control_seed)
+            permutation = rng.permutation(self.ctrl_samples.shape[0])
+            repeats = int(np.ceil(self.ptb_samples.shape[0] / len(permutation)))
+            self.fixed_control_indices = np.tile(permutation, repeats,)[:self.ptb_samples.shape[0]]
+
     def _pert_embedding(self, pert_name):
         embedding = torch.zeros(self.adata.shape[1], dtype=torch.bool)
         perturbs = [self.gene_to_idx[g] for g in pert_name.split('+') if g in self.gene_to_idx]
@@ -91,7 +105,10 @@ class PerturbationDataset(Dataset):
 
     def __getitem__(self, idx):
 
-        j = np.random.randint(0, self.ctrl_samples.shape[0]) #random control cell
+        if self.control_sampling == "random":
+            j = np.random.randint(0, self.ctrl_samples.shape[0])
+        else:
+            j = self.fixed_control_indices[idx]
 
         # Convert ONLY these two specific cells to dense arrays on the fly
         x_dense = self.ctrl_samples[j].toarray().squeeze()
@@ -109,6 +126,7 @@ class PerturbationDataset(Dataset):
     def __len__(self):
         return self.ptb_samples.shape[0]
 
+# TODO: adapt with shuffle option
 def build_model_dataloaders_cell_split(adata, config):
     
     # Setup
@@ -155,7 +173,6 @@ def build_model_dataloaders_cell_split(adata, config):
     print(f"Validation dataset size: {len(val_dataset)}")
 
     return train_loader, val_loader, test_loader, len(train_dataset), len(test_dataset), len(val_dataset)
-
 
 def build_model_dataloaders_perts_split(adata, config):
     
@@ -227,8 +244,9 @@ def build_model_dataloaders_from_perts_list(adata, config, json_path):
     """
     Builds dataloaders using predefined perturbation splits from a JSON file.
     """
-    batch_size = config.get('batch_size', 32)
+
     N_WORKERS = 4 
+    batch_size = config.get('batch_size', 32)
     pert_to_idx = config.get('pert_to_idx')
     
     # 1. Load the splits from the JSON file
@@ -272,14 +290,14 @@ def build_model_dataloaders_from_perts_list(adata, config, json_path):
     gene_to_idx = {node: i for i, node in enumerate(adata.var_names)}
 
     # 6. Create datasets 
-    train_dataset = PerturbationDataset(train_adata, gene_to_idx, pert_to_idx)
-    val_dataset = PerturbationDataset(val_adata, gene_to_idx, pert_to_idx)
-    test_dataset = PerturbationDataset(test_adata, gene_to_idx, pert_to_idx)
+    train_dataset = PerturbationDataset(train_adata, gene_to_idx, pert_to_idx, control_sampling="random")
+    val_dataset = PerturbationDataset(val_adata, gene_to_idx, pert_to_idx, control_sampling="fixed")
+    test_dataset = PerturbationDataset(test_adata, gene_to_idx, pert_to_idx, control_sampling="fixed")
 
     # 7. Create loaders
-    train_loader = DataLoader(train_dataset, batch_sampler=SCDATA_sampler(train_dataset, batch_size), num_workers=N_WORKERS, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_sampler=SCDATA_sampler(val_dataset, batch_size), num_workers=N_WORKERS, pin_memory=True) 
-    test_loader = DataLoader(test_dataset, batch_sampler=SCDATA_sampler(test_dataset, batch_size), num_workers=N_WORKERS, pin_memory=True) 
+    train_loader = DataLoader(train_dataset, batch_sampler=SCDATA_sampler(train_dataset, batch_size, shuffle=True), num_workers=N_WORKERS, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_sampler=SCDATA_sampler(val_dataset, batch_size, shuffle=False), num_workers=N_WORKERS, pin_memory=True) 
+    test_loader = DataLoader(test_dataset, batch_sampler=SCDATA_sampler(test_dataset, batch_size, shuffle=False), num_workers=N_WORKERS, pin_memory=True) 
 
     print(f"Total Unique Perturbations: {total_perts}")
     print(f"Train set: {num_train_perts} perts | {len(train_dataset)} cells")

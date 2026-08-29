@@ -37,9 +37,9 @@ def main(config):
     # Load Data using paths from config
     print("Loading datasets and embeddings...")
     adata = sc.read_h5ad(config['data']['adata_path'])
-    # adata = data_preprocessing(adata,
-    #     logtransform=True, 
-    #     min_cells_per_pert=50)
+    adata = data_preprocessing(adata,
+        logtransform=True, 
+        min_cells_per_pert=50)
 
     with open(config['data']['scgpt_embeddings_path'], "rb") as f:
         scgpt_dict = pickle.load(f)
@@ -155,7 +155,7 @@ def main(config):
         patience=7,
     )
 
-    weights_dir = config['training']['weights_folder_path']
+    weights_dir = config['model']['weights_folder_path']
     if wandb_support and wandb.run is not None:
         final_filepath = os.path.join(weights_dir,f"final_model_{model.architecture_name}_{wandb.run.id}.pth")
     else:

@@ -82,43 +82,7 @@ def train_step_perturb_model(model, data, device, alpha=1., beta=1., gamma=1., e
 
 @torch.no_grad()
 def test_perturb_model(model, loader, device):
-    # model.eval()
-    # pert_mmd = []
-    # pert_wmse = []
-    # for i, data in enumerate(tqdm(loader, desc='testing...')):
-    #     x, y, pert, pert_idx = data
-    #     x, y, pert = x.to(device), y.to(device), pert.to(device)
 
-    #     B = pert.shape[0]
-    #     N = pert.shape[1]
-
-    #     y_hat, _ = model((x,pert)) #[B*N,1]
-    #     y_flat = y.reshape(-1, 1) #[B*N,1]
-
-    #     # weights
-    #     batch_pert_idx = pert_idx[0].item()
-    #     specific_weights = model.weight_lookup[batch_pert_idx].view(1, N)
-
-    #     squared_error = (y_hat - y_flat)**2 # Shape: [B*N, 1]
-        
-    #     # Reshape to [B, N] to match weights
-    #     squared_error_batch = squared_error.reshape(B, N)
-        
-    #     # Calculate Weighted MSE
-    #     # PyTorch automatically broadcasts the [1, N] weights across the [B, N] error batch
-    #     loss_per_cell = torch.sum(squared_error_batch * specific_weights, dim=1)
-    #     error = torch.mean(loss_per_cell)
-    #     pert_wmse.append(error.item())
-
-    #     # mmd
-    #     mmd_error = compute_mmd(y_flat.view(B,N), y_hat.view(B,N))
-    #     pert_mmd.append(mmd_error.item())
-
-    # avg_pert_mmd = sum(pert_mmd)/len(pert_mmd)
-    # avg_pert_wmse = sum(pert_wmse)/len(pert_wmse)
-    # return avg_pert_mmd, avg_pert_wmse
-
-    #### NEW, FIXED CODE ####
     model.eval()
     pert_mmd = []
     pert_wmse = []
@@ -149,7 +113,6 @@ def test_perturb_model(model, loader, device):
     avg_pert_mmd = sum(pert_mmd)/len(pert_mmd)
     avg_pert_wmse = sum(pert_wmse)/len(pert_wmse)
     return avg_pert_mmd, avg_pert_wmse
-
 
 @torch.no_grad()
 def test_perturb_model_pseudobulk(model, loader, device, compute_mmd_fn=compute_weighted_energy_distance):
@@ -182,6 +145,11 @@ def test_perturb_model_pseudobulk(model, loader, device, compute_mmd_fn=compute_
         y_pred = y_hat.view(B, N)
 
         # Assumes your sampler guarantees one perturbation per batch
+        if not torch.all(pert_idx == pert_idx[0]):
+            raise ValueError(
+                "Evaluation batch contains multiple perturbations."
+            )
+
         p = int(pert_idx[0].item())
 
         if p not in sum_true:
@@ -207,11 +175,17 @@ def test_perturb_model_pseudobulk(model, loader, device, compute_mmd_fn=compute_
 
         wmse_p = torch.sum(w * (mu_pred - mu_true).pow(2))
         wmse_by_pert[p] = wmse_p.item()
-
+    
+    # How well does the model perform on the average perturbation?
     avg_wmse_macro = float(np.mean(list(wmse_by_pert.values())))
 
+    # How well does the model perform on the average cell in this dataset?
+    avg_wmse_micro = float(
+        np.average([wmse_by_pert[p] for p in wmse_by_pert], weights=[count[p] for p in wmse_by_pert],)
+    )
+
     if compute_mmd_fn is None:
-        return None, avg_wmse_macro
+        return _, avg_wmse_micro, avg_wmse_macro
 
     mmd_by_pert = {}
 
@@ -223,11 +197,10 @@ def test_perturb_model_pseudobulk(model, loader, device, compute_mmd_fn=compute_
 
     avg_mmd_macro = float(np.mean(list(mmd_by_pert.values())))
 
-    return avg_mmd_macro, avg_wmse_macro
-
+    return avg_mmd_macro, avg_wmse_macro, _
 
 @torch.no_grad()
-def test_perturb_model_new(model, loader, device, var_names, idx_to_gene):
+def final_val_AUPRC(model, loader, device, var_names, idx_to_gene):
     model.eval()
     
     pred_expr_list = []
@@ -316,7 +289,7 @@ def train(model,
     mmd_pert = []
     mmd_ctrl = []
     test_wmse = []
-    test_mmd = []
+    test_weighted_wmse = []
 
     first_batch = next(iter(train_loader))
     batch_size = first_batch[0].shape[0]
@@ -407,9 +380,9 @@ def train(model,
         if epoch!=0:
 
             # We assume this returns your primary metric (MMD)
-            avg_pert_mmd, avg_pert_wmse = test_perturb_model(model, test_loader, device)
+            _, avg_weighted_pert_wmse, avg_pert_wmse = test_perturb_model_pseudobulk(model, test_loader, device, compute_mmd_fn=None)
             test_wmse.append(avg_pert_wmse)
-            test_mmd.append(avg_pert_mmd)
+            test_weighted_wmse.append(avg_weighted_pert_wmse)
 
             # Check if this is the best model so far
             is_best = (avg_pert_wmse > best_val_metric) if metric_mode == 'max' else (avg_pert_wmse < best_val_metric)
@@ -434,7 +407,7 @@ def train(model,
                     "train/mse": epoch_mse,
                     "train/cosine_loss": epoch_cos,
                     "val/test_WMSE": avg_pert_wmse,
-                    "val/test_MMD": avg_pert_mmd
+                    "val/test_weighted_WMSE": avg_weighted_pert_wmse
                 })
 
             # Trigger Early Stopping
@@ -454,10 +427,10 @@ def train(model,
         model.load_state_dict(torch.load(best_filepath))
     
     # Calculate the metric strictly ONCE
-    final_metric_val = test_perturb_model_new(model, test_loader, model.device, var_names, idx_to_gene)
+    final_metric_val = final_val_AUPRC(model, test_loader, model.device, var_names, idx_to_gene)
     print(f"FINAL TEST METRIC: {final_metric_val:.4f}")
     
     if wandb_support:
         wandb.log({"val/AUPRC": final_metric_val})
     
-    return mmd_pert, test_mmd, test_wmse
+    return mmd_pert, test_weighted_wmse, test_wmse
