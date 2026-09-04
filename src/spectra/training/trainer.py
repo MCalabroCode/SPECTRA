@@ -185,7 +185,7 @@ def test_perturb_model_pseudobulk(model, loader, device, compute_mmd_fn=compute_
     )
 
     if compute_mmd_fn is None:
-        return _, avg_wmse_micro, avg_wmse_macro
+        return None, avg_wmse_micro, avg_wmse_macro
 
     mmd_by_pert = {}
 
@@ -197,7 +197,7 @@ def test_perturb_model_pseudobulk(model, loader, device, compute_mmd_fn=compute_
 
     avg_mmd_macro = float(np.mean(list(mmd_by_pert.values())))
 
-    return avg_mmd_macro, avg_wmse_macro, _
+    return avg_mmd_macro, avg_wmse_macro, None
 
 @torch.no_grad()
 def final_val_AUPRC(model, loader, device, var_names, idx_to_gene):
@@ -275,8 +275,6 @@ def train(model,
     metric_mode: Set to 'max' if your validation metric is AUPRC/Accuracy (higher is better). 
                  Set to 'min' if your validation metric is MMD/MSE/Loss (lower is better).
     """
-
-    torch.autograd.set_detect_anomaly(True)
 
     # estract hyperparameters from model.config
     lr = model.config['lr']
@@ -418,7 +416,7 @@ def train(model,
     # ==========================================
     # FINAL EVALUATION PHASE
     # ==========================================
-    torch.autograd.set_detect_anomaly(False)
+
     print("\n--- Training concluded. Initiating Final Evaluation ---")
     
     # Reload the absolute best weights before running the final metric
