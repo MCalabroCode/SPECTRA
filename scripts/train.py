@@ -119,7 +119,7 @@ def main(config):
             gene_weights = pickle.load(f)
     else:
         print('No gene weights dictionary found. Calculating...')
-        gene_weights = compute_weights_enhanced(adata, gene_to_idx, cells_per_pert=128)
+        gene_weights = compute_weights_enhanced(adata, cells_per_pert=128)
         with open(weights_path, 'wb') as f:
             pickle.dump(gene_weights, f)
 
@@ -138,6 +138,7 @@ def main(config):
         device=device, 
         config=model_config,
         gene_embeddings=embedding_matrix,
+        gene_names=adata.var_names,
         gene_weights=gene_weights
     ).to(device)
 
@@ -151,7 +152,6 @@ def main(config):
         device=device,
         wandb_support=wandb_support,
         var_names=adata.var_names.tolist(),
-        idx_to_gene=idx_to_gene,
         patience=7,
     )
 

@@ -140,7 +140,7 @@ def sweep_train():
             with open(weights_path, 'rb') as f:
                 gene_weights = pickle.load(f)
         else:
-            gene_weights = compute_weights(GLOBAL_ADATA, GLOBAL_GENE_TO_IDX, cells_per_pert=256)
+            gene_weights = compute_weights(GLOBAL_ADATA, cells_per_pert=256)
             with open(weights_path, 'wb') as f:
                 pickle.dump(gene_weights, f)
         
@@ -152,6 +152,7 @@ def sweep_train():
             device=device, 
             config=combined_config,
             gene_embeddings=GLOBAL_EMBEDDINGS,
+            gene_names=GLOBAL_ADATA.var_names,
             gene_weights=gene_weights
         ).to(device)
         
@@ -165,7 +166,6 @@ def sweep_train():
             device=device,
             wandb_support=True,
             var_names=GLOBAL_ADATA.var_names.tolist(),
-            idx_to_gene=idx_to_gene,
             patience = 7
         )
 

@@ -13,7 +13,6 @@ def generate_from_control(gene_counts_dict, adata_control, model, gene_to_idx, b
     var_names = adata_control.var_names
 
     # ctrl
-    #adata_control = adata[adata.obs['target_gene'] == 'non-targeting']
     ctrl_data = adata_control.X.toarray() if hasattr(adata_control.X, "toarray") else np.asarray(adata_control.X)
     ctrl_data = torch.tensor(ctrl_data, dtype=torch.float)
 

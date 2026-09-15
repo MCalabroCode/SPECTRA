@@ -76,11 +76,10 @@ def compute_degs(adata, mode='vsrest', pval_threshold=0.05):
     
     return adata_subset.uns['rank_genes_groups']
 
-def compute_weights(adata, gene_to_idx, cells_per_pert=256, score_type = 'scores', power=2.5):
+def compute_weights(adata, cells_per_pert=256, score_type = 'scores', power=2.5):
     '''
     Args:
         adata: Anndata file
-        gene_to_idx: dictionary that maps each gene to the corresponding index
         cells_per_pert: max number of cells to use per each perturbation, to better balance the dataset
         score_type: 'scores' or 'logfoldchanges'
 
@@ -160,7 +159,6 @@ those for an effect-size gate to better highlight relative effects magnitude
 
 def compute_weights_enhanced(
     adata,
-    gene_to_idx,
     cells_per_pert=128,
     power=2.0,
     delta_threshold=0.25,
@@ -177,9 +175,6 @@ def compute_weights_enhanced(
     Args:
         adata:
             AnnData object. adata.X should contain the same normalized expression representation used by the WMSE loss.
-
-        gene_to_idx:
-            Kept for compatibility with the original function.
 
         cells_per_pert:
             Maximum number of cells used per perturbation.

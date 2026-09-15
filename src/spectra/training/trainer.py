@@ -200,7 +200,7 @@ def test_perturb_model_pseudobulk(model, loader, device, compute_mmd_fn=compute_
     return avg_mmd_macro, avg_wmse_macro, None
 
 @torch.no_grad()
-def final_val_AUPRC(model, loader, device, var_names, idx_to_gene):
+def final_val_AUPRC(model, loader, device, var_names):
     model.eval()
     
     pred_expr_list = []
@@ -208,6 +208,8 @@ def final_val_AUPRC(model, loader, device, var_names, idx_to_gene):
     control_expr_list = []
     obs_gene_list = []
     
+    idx_to_gene = model.idx_to_gene
+
     # 1. Accumulate all predictions and ground truths
     for i, data in enumerate(tqdm(loader, desc='testing with AUPRC...')):
         x, y, pert, pert_idx = data
@@ -267,7 +269,6 @@ def train(model,
     device, 
     wandb_support, 
     var_names, 
-    idx_to_gene, 
     patience=7, 
     metric_mode='min'
 ):
@@ -425,7 +426,7 @@ def train(model,
         model.load_state_dict(torch.load(best_filepath))
     
     # Calculate the metric strictly ONCE
-    final_metric_val = final_val_AUPRC(model, test_loader, model.device, var_names, idx_to_gene)
+    final_metric_val = final_val_AUPRC(model, test_loader, model.device, var_names)
     print(f"FINAL TEST METRIC: {final_metric_val:.4f}")
     
     if wandb_support:

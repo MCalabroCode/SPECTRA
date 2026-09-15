@@ -100,10 +100,9 @@ def plot_results(results: dict, metric: str):
     fig, ax = plt.subplots(figsize=(8, 5))
     cmap = plt.cm.viridis  # you can choose others: plasma, coolwarm, etc.
     colors = cmap(np.linspace(0, 1, len(models)))
-    ax.bar(models, means, yerr=stds, capsize=5, ecolor='black', color=colors)
-    #bp = ax.boxplot(values, patch_artist=True, showfliers=False, showmeans=True)
-    # for patch, color in zip(bp['boxes'], colors):
-    #     patch.set_facecolor(color)
+    bp = ax.boxplot(values, patch_artist=True, showfliers=False, showmeans=True)
+    for patch, color in zip(bp['boxes'], colors):
+        patch.set_facecolor(color)
     ax.set_xticklabels(models, rotation=45)
     ax.set_title(metric)
     plt.tight_layout()

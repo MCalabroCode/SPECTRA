@@ -1,4 +1,4 @@
-# SPECTRA: The Most Amazing Perturbation Model out There, or Maybe not 🧬
+# SPECTRA: Graph Signal Propagation over Gene Regulatory Networks for predicting transcriptomic responses to perturbations 🧬
 
 **SPectral CRISPR Transcriptome Regulatory Autoencoder**
 

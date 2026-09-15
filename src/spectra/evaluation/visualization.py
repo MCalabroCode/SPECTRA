@@ -127,3 +127,65 @@ def eval_barplot(results, metric_name):
     plt.legend(frameon=False)
     plt.tight_layout()
 
+def plot_top_de_gene_expression(real_adata, pred_adata, perturbation, n_top_DEGs=100, pert_key="target_gene",
+                                control_label="control", point_size=35, figsize=(8, 8)):
+    """
+    Compares average ground truth vs predicted expression for top n_top_DEGs DE genes.
+    """
+    common_genes = real_adata.var_names.intersection(pred_adata.var_names)
+    gt = real_adata[:, common_genes]
+    pred = pred_adata[:, common_genes]
+    genes = np.array(common_genes)
+
+    def mean_expr(adata_sub, mask):
+        X = adata_sub[mask].X
+        if sparse.issparse(X):
+            return np.asarray(X.mean(axis=0)).ravel()
+        return np.asarray(X.mean(axis=0))
+
+    gt_labels = gt.obs[pert_key].astype(str)
+    pred_labels = pred.obs[pert_key].astype(str)
+
+    gt_pert_mask = gt_labels == perturbation
+    gt_ctrl_mask = gt_labels == control_label
+    pred_pert_mask = pred_labels == perturbation
+
+    if gt_pert_mask.sum() == 0:
+        raise ValueError(f"No ground-truth cells found for perturbation '{perturbation}'")
+    if pred_pert_mask.sum() == 0:
+        raise ValueError(f"No predicted cells found for perturbation '{perturbation}'")
+    if gt_ctrl_mask.sum() == 0:
+        raise ValueError(f"No control cells found with label '{control_label}'")
+
+    gt_pert_mean = mean_expr(gt, gt_pert_mask)
+    gt_ctrl_mean = mean_expr(gt, gt_ctrl_mask)
+    pred_pert_mean = mean_expr(pred, pred_pert_mask)
+
+    de_score = np.abs(gt_pert_mean - gt_ctrl_mean)
+    top_idx = np.argsort(de_score)[::-1][:n_top_DEGs]
+
+    x_val = gt_pert_mean[top_idx]
+    y_val = pred_pert_mean[top_idx]
+    top_genes = genes[top_idx]
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.scatter(x_val, y_val, s=point_size, alpha=0.6, color='#D81B60')
+    lim_min = min(x_val.min(), y_val.min())
+    lim_max = max(x_val.max(), y_val.max())
+    ax.plot([lim_min, lim_max], [lim_min, lim_max], linewidth=2, linestyle='--', color='gray')
+    ax.set_xlim(lim_min, lim_max)
+    ax.set_ylim(lim_min, lim_max)
+    ax.set_xlabel("Ground-truth average expression")
+    ax.set_ylabel("Predicted average expression")
+    ax.set_title(f"{perturbation}: top {n_top_DEGs} ground-truth DE genes")
+    ax.grid(True, linewidth=0.5)
+    plt.tight_layout()
+    plt.show()
+
+    return pd.DataFrame({
+        "gene": top_genes,
+        "gt_mean": x_val,
+        "pred_mean": y_val,
+        "gt_control_mean": gt_ctrl_mean[top_idx],
+        "abs_gt_de": de_score[top_idx],
+    })

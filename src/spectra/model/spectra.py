@@ -146,7 +146,7 @@ class SPECTRA(torch.nn.Module):
     '''
     SPECTRA model class
     '''
-    def __init__(self, edge_index, num_nodes, device, config, gene_embeddings, gene_weights=None):
+    def __init__(self, edge_index, num_nodes, device, config, gene_embeddings, gene_names=None, gene_weights=None):
         super().__init__()
 
         self.device = device 
@@ -157,7 +157,6 @@ class SPECTRA(torch.nn.Module):
         self.n_channels = config['n_channels']
         self.dropout_p = config['dropout_p']
         self.architecture_name = config['architecture']
-        #self.num_node_features = config['num_node_features'] 
         
         self.register_buffer('edge_index', edge_index)
 
@@ -176,9 +175,7 @@ class SPECTRA(torch.nn.Module):
         scgpt_dim = gene_embeddings.shape[1]
 
         self.project_gene = torch.nn.Linear(scgpt_dim, self.n_channels)
-        #self.project_expr = torch.nn.Linear(1, self.n_channels)
         self.film_layer = GeneExpressionFiLM(self.n_channels, shift_scale=0.05)
-
         self.ko_mlp = MLP([scgpt_dim, self.n_channels], batch_norm=False, dropout=0.0) 
 
         self.encoder = VariationalGraphEncoder(self.n_channels, self.n_channels, self.dropout_p, self.res, self.conv_type)
@@ -188,12 +185,17 @@ class SPECTRA(torch.nn.Module):
         self._cached_edge_index = None
         self._cached_gene_ids = None
 
-        num_trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        
-        print('========================================')
-        print(f'number of trainable parameters: {num_trainable_params}')
-        print('========================================')
-    
+        self.gene_names = list(gene_names) if gene_names is not None else None
+        if self.gene_names is not None:
+            assert len(self.gene_names) == num_nodes, (
+                f"Length of gene_names ({len(self.gene_names)}) must match num_nodes ({num_nodes})"
+            )
+            self.gene_to_idx = {g: i for i, g in enumerate(self.gene_names)}
+            self.idx_to_gene = {i: g for i, g in enumerate(self.gene_names)}
+        else:
+            self.gene_to_idx = None
+            self.idx_to_gene = None
+            
     def _get_batched_edge_index(self, batch_size):
         '''
         batched edge lists - edges of the DAG are always the same for every sample
@@ -329,30 +331,26 @@ class SPECTRA(torch.nn.Module):
         self.eval()
         return self.forward(data)[0]
 
-    @torch.no_grad()
-    def downstream_A_from_alpha(edge_index, alpha, N, edge_weight=None):
-        """
-        Builds A[src, dst] for original directed edges src -> dst.
-        This is row-source / column-target convention.
-        """
+    @staticmethod
+    def _downstream_A_from_alpha(edge_index, alpha, N, edge_weight=None):
         src, dst = edge_index
         deg_in = torch.bincount(dst, minlength=N).float().clamp_min(1.0).to(alpha.device)
         vals = alpha / deg_in[dst]
-
         if edge_weight is not None:
             vals = vals * edge_weight.to(alpha.device)
 
         A = torch.sparse_coo_tensor(
-            torch.stack([src, dst]),
-            vals,
-            (N, N),
-            device=alpha.device
+            torch.stack([src, dst]), vals, (N, N), device=alpha.device
         ).to_dense()
-
         return A
 
     @torch.no_grad()
     def compute_downstream_path_matrices(self, x, pert):
+        """
+        Computes layer-wise downstream attention matrices (A1, A2, A3)
+        averaged across the batch, along with reconstructed outputs.
+        """
+        self.eval()
         y_hat, x_hat, (a1, a2, a3) = self.forward((x, pert), return_attention_weights=True)
 
         B = pert.shape[0]
@@ -363,15 +361,13 @@ class SPECTRA(torch.nn.Module):
         alpha2 = a2["alpha_in"].view(B, E)
         alpha3 = a3["alpha_in"].view(B, E)
 
-        A_sum = torch.zeros(N, N, device=self.device)
+        A1_sum = torch.zeros(N, N, device=self.device)
+        A2_sum = torch.zeros(N, N, device=self.device)
+        A3_sum = torch.zeros(N, N, device=self.device)
 
         for b in range(B):
-            A1 = self.downstream_A_from_alpha(self.edge_index, alpha1[b], N)
-            A2 = self.downstream_A_from_alpha(self.edge_index, alpha2[b], N)
-            A3 = self.downstream_A_from_alpha(self.edge_index, alpha3[b], N)
+            A1_sum += self._downstream_A_from_alpha(self.edge_index, alpha1[b], N)
+            A2_sum += self._downstream_A_from_alpha(self.edge_index, alpha2[b], N)
+            A3_sum += self._downstream_A_from_alpha(self.edge_index, alpha3[b], N)
 
-            # row = origin gene, col = destination gene
-            A_sum += A1 @ A2 @ A3
-
-        A_Agg = A_sum / B
-        return A_Agg, y_hat, x_hat
+        return A1_sum / B, A2_sum / B, A3_sum / B, y_hat, x_hat
