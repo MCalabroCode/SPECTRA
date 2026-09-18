@@ -1,4 +1,4 @@
-# SPECTRA: Graph Signal Propagation over Gene Regulatory Networks for predicting transcriptomic responses to perturbations 🧬
+# SPECTRA: predicting cellular perturbation responses with Graph Learning over Gene Regulatory Networks🧬
 
 **SPectral CRISPR Transcriptome Regulatory Autoencoder**
 
@@ -41,7 +41,7 @@ SPECTRA/
 
 ## ⚙️ Installation
 
-1. **Clone the repository (NOTE: not available yet! Just copy the files):**
+1. **Clone the repository**
 
 ```bash
 git clone https://github.com/MCalabroCode/SPECTRA.git
@@ -64,7 +64,7 @@ pip install -e .
 
 ## 🚀 Training
 
-To train a SPECTRA model on a specific dataset, use the `train.py` script. The YAML config file specifies the paths to your dataset, network file, and hyperparameters.
+To train a SPECTRA model on a specific dataset, use the [`scripts/train.py`](scripts/train.py) script. The YAML config file specifies the paths to your dataset, network file, and hyperparameters.
 
 ```bash
 python scripts/train.py --config configs/config.yaml
@@ -81,24 +81,67 @@ To initialize a sweep and start an agent:
 python scripts/run_sweep.py --config configs/sweep_config.yaml --count 10
 ```
 
-## 📊 Evaluation & Inference
+## 📊 Inference & Evaluation
 
-### 1. Interactive Inference
+### 1. Interactive Inference & Interpretability
 
-To load a pre-trained model and test predictions interactively, check out the provided Jupyter Notebook `notebooks/spectra_testing.ipynb`
+To load a pre-trained model, generate data and test predictions interactively, refer to [`notebooks/spectra_testing.ipynb`](notebooks/spectra_testing.ipynb). 
 
-### 2. Full Benchmark Pipeline
+This tutorial walks through:
+- Generating single-cell and pseudobulk expression predictions for out-of-distribution (OOD) knockouts.
+- Extracting directed perturbation-induced cascades and gene regulatory flow.
+- Generating Sankey path flow diagrams and Gene Ontology (GO) enrichment plots.
 
-To evaluate SPECTRA against baselines across multiple metrics, use the `benchmark.py` script. Ensure that your ground-truth data (e.g., `real_adata.h5ad`) and generated predictions (e.g., `pred_adata-<model_name>.h5ad`) are available.
+### 2. Single-Run Evaluation CLI
+
+To evaluate a single run against ground truth using standard perturbation metrics, use [`scripts/evaluate.py`](scripts/evaluate.py). 
+
+Ensure your ground-truth AnnData and model predictions follow the naming convention `pred_adata-<model_name>.h5ad`:
 
 ```bash
-python scripts/benchmark.py \
-    --real results/real_adata.h5ad \
-    --preds results/pred_adata-model1.h5ad \
-            results/pred_adata-model2.h5ad \
+python scripts/evaluate.py \
+    --real results/test_cells.h5ad \
+    --preds results/pred_adata-SPECTRA.h5ad \
+            results/pred_adata-GEARS.h5ad \
+            results/pred_adata-scLambda.h5ad \
     --top_DEGs 50 \
-    --metrics mse pcc_delta edistance f1 common_degs
+    --metrics mse pcc_delta edistance f1 common_degs auprc
 ```
 
-- `--top_DEGs`: Restricts the calculation of metrics to the top $N$ Differentially Expressed Genes. If omitted, metrics are calculated across all genes.
-- `--metrics`: List of metrics to compute (e.g., `mae`, `mse`, `edistance`, `common_degs`, `pcc_delta`).
+**Key Arguments:**
+
+* `--real`: Path to the ground-truth test AnnData file (`.h5ad`).
+* `--preds`: One or more paths to predicted AnnData files (`pred_adata-<model>.h5ad`).
+* `--metrics`: Subset of metrics to compute (`mae`, `mse`, `correlation`, `pcc_delta`, `kldiv`, `wasserstein`, `edistance`, `f1`, `precision`, `auprc`, `common_degs`). If omitted, all available metrics are evaluated.
+* `--top_DEGs`: Restricts evaluation to the top $N$ differentially expressed genes (DEGs). If omitted, metrics are computed across all genes.
+
+### 3. Multi-Run Benchmarking Suites
+
+For comprehensive, multi-seed statistical evaluation across baselines:
+
+* **Custom Benchmark Suite (`notebooks/benchmark.ipynb`):**
+Evaluates multiple repeated runs across models (`SPECTRA`, `GEARS`, `scLambda`, and mean baselines), computing distribution-level and DEG-focused metrics (WMSE, MSE, Wasserstein distance, AUPRC, and differential expression F1/Precision) with automated disk caching and summary reporting.
+* **Standardized Arc Cell-Eval (`notebooks/benchmark_cell_eval.ipynb`):**
+Benchmarks models using the standardized [`cell-eval`](https://github.com/ArcInstitute/cell-eval) framework. Computes:
+* **DEG Overlap & Precision:** `overlap_at_N`, `overlap_at_50/100/200/500`, and `precision_at_k`.
+* **Effect Directionality & Correlation:** `de_direction_match`, `de_spearman_sig`, and `pearson_delta`.
+* **Distance & Discrimination:** L1/L2/cosine discrimination scores, `pearson_edistance`, MSE/MAE, and clustering agreement.
+
+
+
+<!-- ## 📄 Citation
+
+If you use SPECTRA or find this codebase helpful in your research, please cite our preprint:
+
+```bibtex
+@article{calabro2026spectra,
+  title={SPECTRA: predicting cellular perturbation responses with Graph Learning over Gene Regulatory Networks},
+  author={Calabrò, Michele},
+  year={2026}
+}
+
+``` -->
+
+## 📜 License
+
+This project was created by Michele Calabrò and is licensed under the terms of the [MIT License](LICENSE).
