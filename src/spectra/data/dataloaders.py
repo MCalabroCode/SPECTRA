@@ -58,7 +58,6 @@ class SCDATA_sampler(Sampler):
 
 def chunk(indices, chunk_size):
     split = torch.split(torch.tensor(indices), chunk_size) # this divides the torch indices into subsets of equal length chunk_size
-    #NOTE: split will be a tuple of tensors
     if len(indices) % chunk_size == 0:
         return split
     elif len(split) > 0:

@@ -1,6 +1,6 @@
 """
-spectra.interpretability
-========================
+spectra interpretability analysis tools
+
 Analysis and visualization toolkit for SPECTRA learned FAGCN weights graphs,
 cascade path discovery, and predicted differential expression profiles.
 """

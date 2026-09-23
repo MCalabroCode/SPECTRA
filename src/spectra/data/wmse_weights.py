@@ -148,15 +148,6 @@ def compute_weights(adata, cells_per_pert=256, score_type = 'scores', power=2.5)
 
     return final_weight_dict
 
-
-'''
-Wwighted Mean Squared Error logic inspired by: "Diversity by Design: Addressing Mode Collapse 
-Improves scRNA-seq Perturbation Modeling on Well-Calibrated Metrics", Miller et al.
-
-here, in respect with the original strategy that takes just the test z-scores, we multiply
-those for an effect-size gate to better highlight relative effects magnitude
-'''
-
 def compute_weights_enhanced(
     adata,
     cells_per_pert=128,
@@ -164,31 +155,21 @@ def compute_weights_enhanced(
     delta_threshold=0.25,
     pval_threshold=0.01
 ):
-    """
-    Compute WMSE weights using Scanpy Wilcoxon scores, modulated by
-    a soft mean-expression-difference gate.
+    '''
+    Weights of WMSE logic inspired by: "Diversity by Design: Addressing Mode Collapse 
+    Improves scRNA-seq Perturbation Modeling on Well-Calibrated Metrics", Miller et al.
 
-    For each perturbation and gene:
-
-        importance = abs(Wilcoxon score)   *   min(abs(mean_pert - mean_rest) / delta_threshold, 1)
+    here, in respect with the original strategy that takes just the test z-scores, we multiply
+    those for an effect-size gate to better highlight relative effects magnitude
 
     Args:
-        adata:
-            AnnData object. adata.X should contain the same normalized expression representation used by the WMSE loss.
-
-        cells_per_pert:
-            Maximum number of cells used per perturbation.
-
-        power:
-            Exponent used to strengthen the normalized weights.
-
-        delta_threshold:
-            Absolute mean-expression difference at which the gate
-            reaches 1. This is expressed in the same units as adata.X.
+        adata: Anndata file
+        cells_per_pert: max number of cells to use per each perturbation, to better balance the dataset
+        score_type: 'scores' or 'logfoldchanges'
 
     Returns:
-        Dictionary containing one weight vector per perturbation.
-    """
+        a dictionary of weights for each perturbation
+    '''
 
     # Subsample at most cells_per_pert cells for each perturbation, 
     # to create a more balanced dataset
