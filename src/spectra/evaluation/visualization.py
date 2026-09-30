@@ -1,6 +1,8 @@
 import numpy as np
 import anndata as ad
 import scanpy as sc
+import pandas as pd
+from scipy import sparse
 from matplotlib import pyplot as plt
 
 def plot_violins_predictions_selected_genes(gene_list: list, real_adata: ad.AnnData, pred_adata: ad.AnnData, save: bool, title: str):

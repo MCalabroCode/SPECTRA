@@ -129,18 +129,19 @@ Benchmarks models using the standardized [`cell-eval`](https://github.com/ArcIns
 
 
 
-<!-- ## 📄 Citation
+## 📄 Citation
 
 If you use SPECTRA or find this codebase helpful in your research, please cite our preprint:
 
 ```bibtex
-@article{calabro2026spectra,
-  title={SPECTRA: predicting cellular perturbation responses with Graph Learning over Gene Regulatory Networks},
-  author={Calabrò, Michele},
-  year={2026}
+@article {calabro2026spectra,
+	author = {Calabro, Michele and Sheehan, Patrick and Cambuli, Francesco and Sottoriva, Andrea},
+	title = {SPECTRA: predicting cellular perturbation responses with Graph Learning over Gene Regulatory Networks},
+	year = {2026},
+	doi = {10.64898/2026.09.21.752624},
+	journal = {bioRxiv}
 }
-
-``` -->
+```
 
 ## 📜 License
 
