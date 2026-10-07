@@ -1,0 +1,32 @@
+project:
+  name: "test_k562"
+  seed: 42
+  deterministic: False
+  use_wandb: True
+
+data:
+  adata_path: "/group/sottoriva/michele.calabro/SPECTRA/data/rep_k562/repk562_filtered_min100cells_40res_60cellres.h5ad"
+  network_path: "/group/sottoriva/michele.calabro/SPECTRA/data/rep_k562/guanlab_replogle_pruned_reciprocal_mst.tsv"
+  scgpt_embeddings_path: "/group/sottoriva/michele.calabro/SPECTRA/data/vcc/scGPT_embeddings_all_genes.pkl"
+  gene_weights_path: "/group/sottoriva/michele.calabro/SPECTRA/data/rep_k562/gene_weights-k562.pkl"
+  split_path: "/group/sottoriva/michele.calabro/SPECTRA/data/rep_k562/k562_guanlab_pruned_split.json"
+
+model:
+  architecture: "k562"
+  weights_folder_path: "/group/sottoriva/michele.calabro/SPECTRA/weights"
+  conv_type: 'FAGCN'
+  residual_weight: 0.8
+  n_channels: 24
+  dropout_p: 0.05
+  num_node_features: 1
+
+training:
+  batch_size: 128
+  lr: 0.001
+  n_epochs: 50
+  alpha: 4.4
+  beta: 0.005
+  gamma: 2.7
+  eta: 1.0
+  test_ratio: 0.2
+  val_ratio: 0.1

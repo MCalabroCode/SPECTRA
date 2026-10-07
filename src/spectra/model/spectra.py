@@ -177,7 +177,6 @@ class SPECTRA(torch.nn.Module):
         self.project_gene = torch.nn.Linear(scgpt_dim, self.n_channels)
         self.film_layer = GeneExpressionFiLM(self.n_channels, shift_scale=0.05)
         self.ko_mlp = MLP([scgpt_dim, self.n_channels], batch_norm=False, dropout=0.0) 
-
         self.encoder = VariationalGraphEncoder(self.n_channels, self.n_channels, self.dropout_p, self.res, self.conv_type)
         self.gex_decoder = FeatureDecoder(self.n_channels, 1, self.dropout_p, self.res, self.conv_type)
         

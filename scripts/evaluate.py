@@ -17,10 +17,14 @@ METRICS_REGISTRY = {
     "edistance":calc_edistance,
     "f1":calc_f1,
     "precision":calc_precision,
-    "auprc":calc_auprc
+    "auprc":calc_auprc,
+    "jaccard":calc_jaccard
 }
 
-def process_datasets(real_path, pred_paths, top_degs, metrics=None):
+# metrics that can be restricted to the ground-truth top DEGs of each perturbation
+DEG_AWARE_METRICS = {"mae", "correlation", "mse", "kldiv", "pcc_delta", "edistance", "wasserstein"}
+
+def process_datasets(real_path, pred_paths, n_top_degs=None, metrics=None, degs_cache=None):
     """
     Loads the real dataset once, then iterates through prediction files
     one by one to compare, save, and free memory.
@@ -33,6 +37,20 @@ def process_datasets(real_path, pred_paths, top_degs, metrics=None):
 
     print(f"[*] Loading real dataset from: {real_path}")
     real_adata = ad.read_h5ad(real_path)
+
+    # Ground-truth top DEGs depend only on the real data: computed ONCE here (and cached on disk
+    # for future runs), then shared by every model and every DEG-aware metric.
+    top_degs = None
+    if n_top_degs is not None:
+        cache_path = degs_cache or f"{os.path.splitext(real_path)[0]}.top{n_top_degs}_degs.json"
+        st = os.stat(real_path)
+        top_degs = load_or_compute_top_degs(
+            real_adata, n_top_degs, cache_path, fingerprint=f"{st.st_size}-{st.st_mtime_ns}"
+        )
+
+    # AUPRC ground-truth labels are also model-independent: calc_auprc fills this dict on the
+    # first model and reuses it for the next ones (same process).
+    auprc_true_labels = {}
 
     # for each model's prediction
     for path in pred_paths:
@@ -65,11 +83,12 @@ def process_datasets(real_path, pred_paths, top_degs, metrics=None):
         for metric_name in metrics:
             print(f"    -> Calculating {metric_name}...")
             metric_func = METRICS_REGISTRY[metric_name]
-            if metric_name in ['mse', 'kldiv', 'pcc_delta', 'edistance', 'wasserstein']:
-                score = metric_func(real_adata, p_adata, n_top_degs=top_degs)
-            else:
-                score = metric_func(real_adata, p_adata)
-            results[metric_name][model_name] = score
+            kwargs = {}
+            if metric_name in DEG_AWARE_METRICS and top_degs is not None:
+                kwargs["top_degs"] = top_degs
+            elif metric_name == "auprc":
+                kwargs["true_labels"] = auprc_true_labels
+            results[metric_name][model_name] = metric_func(real_adata, p_adata, **kwargs)
 
         # Free memory
         del p_adata
@@ -98,7 +117,7 @@ def plot_results(results: dict, metric: str):
     stds = [np.std(v, ddof=1) for v in values]
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    cmap = plt.cm.viridis  # you can choose others: plasma, coolwarm, etc.
+    cmap = plt.cm.viridis
     colors = cmap(np.linspace(0, 1, len(models)))
     bp = ax.boxplot(values, patch_artist=True, showfliers=False, showmeans=True)
     for patch, color in zip(bp['boxes'], colors):
@@ -140,13 +159,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "--top_DEGs",
         type=int,
-        help="Specify on which DEGs genes to run the metrics. If omitted, runs on all genes."
+        help="Run the DEG-aware metrics (mae, correlation, mse, kldiv, pcc_delta, edistance, wasserstein) "
+             "only on the top-N ground-truth DEGs of each perturbation. If omitted, runs on all genes."
+    )
+
+    parser.add_argument(
+        "--degs_cache",
+        type=str,
+        default=None,
+        help="JSON file where the ground-truth top DEGs are cached "
+             "(default: <real file>.top<N>_degs.json next to the real .h5ad)."
     )
 
     args = parser.parse_args()
 
     # Pass args.metrics into the function
-    final_results = process_datasets(args.real, args.preds, args.top_DEGs, metrics=args.metrics)
+    final_results = process_datasets(args.real, args.preds, args.top_DEGs, metrics=args.metrics, degs_cache=args.degs_cache)
     print("[*] All evaluations complete.")
 
 

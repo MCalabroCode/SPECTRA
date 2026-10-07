@@ -6,64 +6,96 @@ import anndata as ad
 import scipy.stats as stats
 from sklearn.metrics import precision_recall_curve, auc, average_precision_score, confusion_matrix, ConfusionMatrixDisplay
 from statsmodels.stats.multitest import multipletests
+from numba import njit, prange
+from scipy import sparse
+from scipy.stats import false_discovery_control  # scipy >= 1.11
 from scipy.stats import rankdata
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-import os
+import numba
+import json
+import math
 import sys
+import os
 
 sc.settings.verbosity = 0
 
 import warnings
 warnings.filterwarnings('ignore')
 
-def calc_mae(real_adata, pred_adata):
-    assert set(real_adata.obs['target_gene'].values) == set(pred_adata.obs['target_gene'].values), "perturbations not matching"
+# Single source of truth for "what is a DEG": used by the 
+# DES metrics (f1/precision/jaccard), by AUPRC and by the
+# top-DEG selection for the DEG-restricted metrics.
+DEG_LFC_THRESHOLD = 0.3
+DEG_ALPHA = 0.01 
 
-    mae = {}
-    for pert in real_adata.obs['target_gene'].unique():
-        selected_real = real_adata[real_adata.obs['target_gene']==pert].X
-        selected_pred = pred_adata[pred_adata.obs['target_gene']==pert].X
-        
-        # Convert sparse matrices (if needed)
-        if not isinstance(selected_real, np.ndarray):
-            selected_real = selected_real.toarray()
-        if not isinstance(selected_pred, np.ndarray):
-            selected_pred = selected_pred.toarray()
+# DEG-restricted metrics (mae, corr, mse, ...) are NaN for perturbations with fewer DEGs than this
+# MIN_DEG_GENES = 3
 
-        # pseudobulk
-        mean_real = np.mean(selected_real, axis=0)
-        mean_pred = np.mean(selected_pred, axis=0)
+# A gene is testable only if detected (x > 0) in more than this fraction of the cells of the
+# perturbed OR the control group
+DEG_MIN_CELL_FRACTION = 0.0
 
-        mae[pert] = np.mean(np.abs(mean_real - mean_pred))
+# ok so this just extract the pre-calculated gt DEGs for pert
+def _degs_for(top_degs, pert):
+    """Gene list of `pert` from a {pert: [genes]} dict (raises if missing)."""
+    key = pert if pert in top_degs else str(pert)
+    if key not in top_degs:
+        raise KeyError(f"top_degs has no entry for perturbation '{pert}'")
+    return top_degs[key]
 
-    return mae
+# this just assures gene var columns are the same, and subset to genes is genes is not None
+def _aligned_cols(real_adata, pred_adata, genes=None):
+    """Column indices (in real, in pred) of the same genes, in the same order.
+    genes=None -> all genes (positional if var_names are identical, else the intersection)."""
+    if genes is None:
+        if real_adata.var_names.equals(pred_adata.var_names):
+            return slice(None), slice(None)
+        genes = real_adata.var_names.intersection(pred_adata.var_names)
+    else:
+        genes = [g for g in genes if g in real_adata.var_names and g in pred_adata.var_names]
+    return real_adata.var_names.get_indexer(genes), pred_adata.var_names.get_indexer(genes)
 
-def calc_corr(real_adata, pred_adata, correlation='pearson'):
-    assert set(real_adata.obs['target_gene'].values) == set(pred_adata.obs['target_gene'].values), "perturbations not matching"
+# pseudobulk in log space
+def _pseudobulk(adata, rows, cols):
+    """Mean expression profile of cells `rows`, restricted to gene columns `cols`."""
+    X = adata.X[rows][:, cols]
+    return np.asarray(X.mean(axis=0, dtype=np.float64)).ravel()
 
-    corr = {}
-    for pert in real_adata.obs['target_gene'].unique():
-        selected_real = real_adata[real_adata.obs['target_gene']==pert].X
-        selected_pred = pred_adata[pred_adata.obs['target_gene']==pert].X
-        
-        # Convert sparse matrices (if needed)
-        if not isinstance(selected_real, np.ndarray):
-            selected_real = selected_real.toarray()
-        if not isinstance(selected_pred, np.ndarray):
-            selected_pred = selected_pred.toarray()
-        
-        # CORRECTION: pseudobulk - otherise we would assume aligment of cells - absurd
-        real_mean = selected_real.mean(axis=0)
-        pred_mean = selected_pred.mean(axis=0)
-        if correlation == "spearman":
-            r = stats.spearmanr(real_mean, pred_mean)[0]
-        else:
-            r = stats.pearsonr(real_mean, pred_mean)[0]
-        
-        corr[pert] = r
+# Returns (pert, real_mean, pred_mean) for every non-control perturbation (eventually restricted to top_degs).
+def _per_pert_profiles(real_adata, pred_adata, top_degs, control_tag, condition_col):
+    """
+    Returns (pert, real_mean, pred_mean) for every non-control perturbation.
+    If top_degs ({pert: [genes]}) is given, profiles are restricted to that 
+    perturbation's DEGs.
+    """
+    assert set(real_adata.obs[condition_col].values) == set(pred_adata.obs[condition_col].values), "perturbations not matching"
+    real_idx = real_adata.obs.groupby(condition_col, observed=True).indices
+    pred_idx = pred_adata.obs.groupby(condition_col, observed=True).indices
+    for pert in real_idx:
+        if pert == control_tag:
+            continue
+        genes = None if top_degs is None else _degs_for(top_degs, pert)
+        rc, pc = _aligned_cols(real_adata, pred_adata, genes)
+        # if genes is not None and len(rc) < MIN_DEG_GENES:  # too few DEGs for a meaningful score
+        #     yield pert, None, None
+        #     continue
+        yield pert, _pseudobulk(real_adata, real_idx[pert], rc), _pseudobulk(pred_adata, pred_idx[pert], pc)
 
-    return corr
+
+def calc_mae(real_adata, pred_adata, top_degs=None, control_tag='non-targeting', condition_col='target_gene'):
+    """MAE between real and predicted pseudobulk profiles, per perturbation.
+    top_degs: optional {pert: [genes]} -> compute on those genes only."""
+    return {pert: (np.nan if r is None else float(np.mean(np.abs(r - p))))
+            for pert, r, p in _per_pert_profiles(real_adata, pred_adata, top_degs, control_tag, condition_col)}
+
+
+def calc_corr(real_adata, pred_adata, correlation='pearson', top_degs=None, control_tag='non-targeting', condition_col='target_gene'):
+    """Correlation between real and predicted pseudobulk profiles (pseudobulk: otherwise we would
+    assume alignment of cells - absurd). top_degs: optional {pert: [genes]} -> those genes only."""
+    corr_fn = stats.spearmanr if correlation == "spearman" else stats.pearsonr
+    return {pert: (np.nan if r is None else float(corr_fn(r, p)[0]))
+            for pert, r, p in _per_pert_profiles(real_adata, pred_adata, top_degs, control_tag, condition_col)}
 
 
 ########################################################
@@ -71,58 +103,61 @@ def calc_corr(real_adata, pred_adata, correlation='pearson'):
 ########################################################
 
 class RobustDES:
-    def __init__(self, 
-                 lfc_threshold=0.5, 
-                 alpha=0.05,
-                 min_cell_fraction=0.1):
+    def __init__(self,
+                 lfc_threshold=DEG_LFC_THRESHOLD,
+                 alpha=DEG_ALPHA,
+                 min_cell_fraction=DEG_MIN_CELL_FRACTION):
         """
+        DEG calling shared with AUPRC: same Wilcoxon kernel (tie + continuity corrected), same logFC,
+        same gene-eligibility filter.
+
         lfc_threshold: Minimum abs(Log2 Fold Change) to consider a gene DE.
-        alpha: Adjusted p-value threshold (FDR).
-        min_cell_fraction: Gene must be expressed in at least this fraction of cells in the perturbation group. (Solves sparsity).
+            LFC = log2 ratio of the arithmetic means in linear space, mean(expm1(x)).
+        alpha: Adjusted p-value threshold (BH-FDR over all genes).
+        min_cell_fraction: a gene is eligible only if it is detected (x > 0) in more than this fraction of
+            the cells of EITHER group (perturbed or control), as Seurat's min.pct. Requiring it in the
+            perturbed group only would drop strongly down-regulated genes (e.g. the knocked-out target).
+            None / 0 disables the filter.
         """
         self.lfc_threshold = lfc_threshold
         self.alpha = alpha
         self.min_cell_fraction = min_cell_fraction
+        self._ctx_cache = {}
 
-    def get_de_genes(self, adata, perturbation_key, perturb_label, control_label):
+    def _get_context(self, adata, perturbation_key, control_label):
         """
-        Runs scanpy.tl.rank_genes_groups with robust filtering.
+        Row indices per group + control context, built once per AnnData object.
         """
-        # Subset to specific perturbation vs control
-        subset = adata[adata.obs[perturbation_key].isin([perturb_label, control_label])].copy()
-        # Run Wilcoxon (Standard)
-        sc.tl.rank_genes_groups(
-            subset, 
-            groupby=perturbation_key, 
-            groups=[perturb_label],
-            reference=control_label,
-            method='wilcoxon', #wilcoxon is better, but slower
-            corr_method="benjamini-hochberg",
-            use_raw=False
-        )
-        # Extract results
-        result_df = sc.get.rank_genes_groups_df(subset, group=perturb_label) # columns: [scores, logfoldchanges, pvals, pvals_adj], shape [num_genes, 4]
-        
-        # Calculate fraction of cells expressing the gene in the perturbation group
-        perturb_cells = subset[subset.obs[perturbation_key] == perturb_label]
-        X = perturb_cells.X
-        if hasattr(X, "toarray") or hasattr(X, "tocsr"):
-            detected_vals = np.array((X > 0).mean(axis=0)).flatten()
+        key = (id(adata), perturbation_key, control_label)
+        hit = self._ctx_cache.get(key)
+        if hit is None or hit[0] is not adata:
+            groups = adata.obs.groupby(perturbation_key, observed=True).indices
+            if control_label not in groups:
+                raise ValueError(f"Control '{control_label}' not found in adata.")
+            ctrl = _ControlContext(_dense(adata.X[groups[control_label]]))
+            hit = (adata, groups, ctrl)
+            self._ctx_cache[key] = hit
+        return hit[1], hit[2]
+
+    def get_de_genes(self, adata, perturbation_key, perturb_label, control_label, eligible=None):
+        """
+        Perturbation vs control DE test (fast Wilcoxon) with the shared DEG definition.
+        eligible: optional pd.Series (index = gene name, bool). Pass the ground-truth eligibility when
+            calling on predictions, so that the filter is decided on real data only. If None, it is
+            computed from `adata` itself.
+        Returns (DEG table [names -> logfoldchanges], full per-gene table).
+        """
+        groups, ctrl = self._get_context(adata, perturbation_key, control_label)
+        st = _de_stats(_dense(adata.X[groups[perturb_label]]), ctrl)
+        result_df = pd.DataFrame({"names": adata.var_names.values, **st})
+        if eligible is None:
+            elig = _eligible(st["pct_cells"], ctrl.det, self.min_cell_fraction)
         else:
-            detected_vals = np.array((X > 0).mean(axis=0)).flatten()
-        
-        # rank_genes_groups_df uses gene names as values, not index
-        gene_map = dict(zip(subset.var_names, detected_vals))
-        result_df['pct_cells'] = result_df['names'].map(gene_map)
+            elig = result_df["names"].map(eligible).fillna(False).values.astype(bool)
+        result_df["eligible"] = elig
 
-        mask_sig = (result_df['pvals_adj'] < self.alpha)
-        mask_lfc = (result_df['logfoldchanges'].abs() > self.lfc_threshold)
-        mask_sparsity = (result_df['pct_cells'] > self.min_cell_fraction)
-        
-        # The robust set of DE genes
-        de_genes_df = result_df[mask_sig & mask_lfc & mask_sparsity].copy()
-        
-        return de_genes_df[['names', 'logfoldchanges']].set_index('names'), result_df
+        mask = _deg_mask(st, elig, self.lfc_threshold, self.alpha)
+        return result_df.loc[mask, ["names", "logfoldchanges"]].set_index("names"), result_df
 
     def _core_precision(self, adata_true, adata_pred, perturbation_key, perturb_label, control_label):
         """
@@ -138,15 +173,39 @@ class RobustDES:
             return 0.0 # Avoid division by zero, or handle as specific case
 
         # identify Predicted DE Genes (G_pred)
-        df_pred, result_df_pred = self.get_de_genes(adata_pred, perturbation_key, perturb_label, control_label)
+        df_pred, result_df_pred = self.get_de_genes(adata_pred, perturbation_key, perturb_label, control_label,
+                                                    eligible=result_df_true.set_index('names')['eligible'])
         G_pred = set(df_pred.index)
         n_pred = len(G_pred)
-        # print(f'pert {perturb_label} - n_true = {n_true}, n_pred = {n_pred}')
-        # print(perturb_label in G_pred)
 
         # true positives
         TP = G_pred.intersection(G_true)
         score = len(TP)/(n_pred+1e-8)
+
+        return score
+    
+    def _core_jaccard(self, adata_true, adata_pred, perturbation_key, perturb_label, control_label):
+        """
+        Jaccard index |G_true & G_pred| / |G_true | G_pred| between the true and predicted DE gene sets.
+        """
+        # identify True DE Genes (G_true)
+        df_true, result_df_true = self.get_de_genes(adata_true, perturbation_key, perturb_label, control_label)
+        G_true = set(df_true.index)
+        n_true = len(G_true)
+
+        if n_true == 0:
+            return 0.0 # Avoid division by zero, or handle as specific case
+
+        # identify Predicted DE Genes (G_pred)
+        df_pred, result_df_pred = self.get_de_genes(adata_pred, perturbation_key, perturb_label, control_label,
+                                                    eligible=result_df_true.set_index('names')['eligible'])
+        G_pred = set(df_pred.index)
+        n_pred = len(G_pred)
+
+        # jaccard index
+        intersection = G_pred.intersection(G_true)
+        union = G_pred.union(G_true)
+        score = len(intersection) / len(union)
 
         return score
 
@@ -161,10 +220,10 @@ class RobustDES:
             return 0.0 # Avoid division by zero, or handle as specific case
 
         # identify Predicted DE Genes (G_pred)
-        df_pred, result_df_pred = self.get_de_genes(adata_pred, perturbation_key, perturb_label, control_label)
+        df_pred, result_df_pred = self.get_de_genes(adata_pred, perturbation_key, perturb_label, control_label,
+                                                    eligible=result_df_true.set_index('names')['eligible'])
         G_pred = set(df_pred.index)
         n_pred = len(G_pred)
-        # print(f'pert {perturb_label} - n_true = {n_true}, n_pred = {n_pred}')
 
         # true positives
         TP = G_pred.intersection(G_true)
@@ -179,9 +238,10 @@ class RobustDES:
         all_genes = adata_true.var_names
         total_cm = np.zeros((2, 2))
         for pert in tqdm(perts):
-            df_true, _ = self.get_de_genes(adata_true, perturbation_key, pert, control_label)
+            df_true, res_true = self.get_de_genes(adata_true, perturbation_key, pert, control_label)
             G_true = set(df_true.index)
-            df_pred, _ = self.get_de_genes(adata_pred, perturbation_key, pert, control_label)
+            df_pred, _ = self.get_de_genes(adata_pred, perturbation_key, pert, control_label,
+                                           eligible=res_true.set_index('names')['eligible'])
             G_pred = set(df_pred.index)
 
             # Converts a set of DE genes into a binary vector (1=DE, 0=Not DE) aligned to 'all_genes'
@@ -207,9 +267,10 @@ class RobustDES:
         plt.show()
         return mean_cm
 
-def calc_f1(real_adata, pred_adata, lfc_threshold=0.3, alpha=0.01):
+def calc_f1(real_adata, pred_adata, lfc_threshold=DEG_LFC_THRESHOLD, alpha=DEG_ALPHA,
+            min_cell_fraction=DEG_MIN_CELL_FRACTION):
 
-    des_calculator = RobustDES(lfc_threshold=lfc_threshold, alpha=alpha)
+    des_calculator = RobustDES(lfc_threshold=lfc_threshold, alpha=alpha, min_cell_fraction=min_cell_fraction)
 
     assert set(real_adata.obs['target_gene'].unique()) == set(pred_adata.obs['target_gene'].unique()), "perturbations do not match"
 
@@ -217,14 +278,27 @@ def calc_f1(real_adata, pred_adata, lfc_threshold=0.3, alpha=0.01):
     scores = {}
     for pert in tqdm(perts):
         scores[pert] = des_calculator._core_f1(real_adata, pred_adata, 'target_gene', pert, 'non-targeting')
-        # print(f'score: {scores[pert]}')
-        # print('---------------------')
 
     return scores
 
-def calc_precision(real_adata, pred_adata, lfc_threshold=0.3, alpha=0.01):
+def calc_jaccard(real_adata, pred_adata, lfc_threshold=DEG_LFC_THRESHOLD, alpha=DEG_ALPHA,
+                 min_cell_fraction=DEG_MIN_CELL_FRACTION):
 
-    des_calculator = RobustDES(lfc_threshold=lfc_threshold, alpha=alpha)
+    des_calculator = RobustDES(lfc_threshold=lfc_threshold, alpha=alpha, min_cell_fraction=min_cell_fraction)
+
+    assert set(real_adata.obs['target_gene'].unique()) == set(pred_adata.obs['target_gene'].unique()), "perturbations do not match"
+
+    perts = [pert for pert in real_adata.obs['target_gene'].unique() if pert != 'non-targeting']
+    scores = {}
+    for pert in tqdm(perts):
+        scores[pert] = des_calculator._core_jaccard(real_adata, pred_adata, 'target_gene', pert, 'non-targeting')
+
+    return scores
+
+def calc_precision(real_adata, pred_adata, lfc_threshold=DEG_LFC_THRESHOLD, alpha=DEG_ALPHA,
+                   min_cell_fraction=DEG_MIN_CELL_FRACTION):
+
+    des_calculator = RobustDES(lfc_threshold=lfc_threshold, alpha=alpha, min_cell_fraction=min_cell_fraction)
 
     assert set(real_adata.obs['target_gene'].unique()) == set(pred_adata.obs['target_gene'].unique()), "perturbations do not match"
 
@@ -232,8 +306,6 @@ def calc_precision(real_adata, pred_adata, lfc_threshold=0.3, alpha=0.01):
     scores = {}
     for pert in tqdm(perts):
         scores[pert] = des_calculator._core_precision(real_adata, pred_adata, 'target_gene', pert, 'non-targeting')
-        # print(f'score: {scores[pert]}')
-        # print('---------------------')
 
     return scores
 
@@ -241,82 +313,233 @@ def calc_precision(real_adata, pred_adata, lfc_threshold=0.3, alpha=0.01):
 ##################### AUPRC SCORE ######################
 ########################################################
 
-def calc_auprc(adata_true, adata_pred, pert_col='target_gene', control_name='non-targeting', fdr_thresh=0.01, logfc_thresh=0.3):
+"""
+Fast DEG-recovery AUPRC (Zhu et al. 2025) with a Wilcoxon rank-sum test.
+
+Main speed-up: the control cells are sorted ONCE, and each perturbation's
+Mann-Whitney U is computed by binary search against the sorted control
+(numba, multi-threaded). Same asymptotic, tie- and continuity-corrected
+p-values as scipy.stats.mannwhitneyu(..., method="asymptotic"), without
+re-ranking thousands of control cells for every perturbation.
+"""
+
+# ----------------------------------------------------------------------------
+# Wilcoxon kernel
+# ----------------------------------------------------------------------------
+@njit(parallel=True, cache=True)
+def _ctrl_tie_term(ctrl_sorted):
+    G, n2 = ctrl_sorted.shape
+    out = np.zeros(G)
+    for g in prange(G):
+        c = ctrl_sorted[g]
+        i = 0
+        s = 0.0
+        while i < n2:
+            j = i + 1
+            while j < n2 and c[j] == c[i]:
+                j += 1
+            t = float(j - i)
+            s += t * t * t - t
+            i = j
+        out[g] = s
+    return out
+
+
+def prepare_control(X_ctrl):
     """
-    Calculates AUPRC for predicted scRNA-seq perturbation responses.
-    Assumes adata.X contains log-normalized counts (e.g., log1p).
+    Sort control once. X_ctrl: dense (n_ctrl, G) -> ((G, n_ctrl), (G,)).
     """
-    common_genes = adata_true.var_names.intersection(adata_pred.var_names)
-    adata_true = adata_true[:, common_genes].copy()
-    adata_pred = adata_pred[:, common_genes].copy()
+    ctrl_sorted = np.ascontiguousarray(np.sort(X_ctrl, axis=0).T)
+    return ctrl_sorted, _ctrl_tie_term(ctrl_sorted)
 
-    # isolate the in vitro control cells (used for both GT and Pred comparisons)
-    control_mask = adata_true.obs[pert_col] == control_name
-    X_control_true = adata_true[control_mask].X.toarray() if hasattr(adata_true.X, 'toarray') else adata_true.X
-    #mean_control_true = np.mean(X_control_true, axis=0)
-    mean_control_true = np.mean(np.expm1(X_control_true), axis=0)    
 
-    perturbations = [p for p in adata_true.obs[pert_col].unique() if p != control_name]
-    
-    model_results = {}
-    baseline_results = {}
-    
-    for pert in tqdm(perturbations):
+@njit(parallel=True, cache=True)
+def mwu_vs_sorted_control(X_pert, ctrl_sorted, ctrl_tie):
+    """Two-sided Mann-Whitney U per gene (asymptotic, tie + continuity corrected).
+    X_pert: dense (n1, G). Returns (pvals, z): z is signed (> 0: higher in X_pert) and is
+    used to rank DEGs (it does not underflow like the p-value)."""
+    n1, G = X_pert.shape
+    n2 = ctrl_sorted.shape[1]
+    n = n1 + n2
+    pvals = np.ones(G)
+    zs = np.zeros(G)
+    for g in prange(G):
+        col = np.sort(X_pert[:, g])
+        c = ctrl_sorted[g]
+        U = 0.0
+        tie = ctrl_tie[g]
+        i = 0
+        while i < n1:
+            v = col[i]
+            j = i + 1
+            while j < n1 and col[j] == v:
+                j += 1
+            p = float(j - i)
+            lo = np.searchsorted(c, v, side="left")
+            hi = np.searchsorted(c, v, side="right")
+            cv = float(hi - lo)
+            U += p * (lo + 0.5 * cv)
+            t = cv + p
+            tie += (t * t * t - t) - (cv * cv * cv - cv)
+            i = j
+        mu = n1 * n2 / 2.0
+        U1 = U
+        U = max(U, n1 * n2 - U)
+        var = n1 * n2 / 12.0 * ((n + 1.0) - tie / (n * (n - 1.0)))
+        if var <= 0.0:
+            pvals[g] = 1.0
+        else:
+            z = max((U - mu - 0.5) / math.sqrt(var), 0.0)
+            pvals[g] = min(math.erfc(z / math.sqrt(2.0)), 1.0)
+            zs[g] = z if U1 >= mu else -z
+    return pvals, zs
 
-        # GT DEGs (In Vitro vs In Vitro)
-        mask_pert_true = adata_true.obs[pert_col] == pert
-        X_pert_true = adata_true[mask_pert_true].X.toarray() if hasattr(adata_true.X, 'toarray') else adata_true[mask_pert_true].X
-        #mean_pert_true = np.mean(X_pert_true, axis=0)
-        mean_pert_true = np.mean(np.expm1(X_pert_true), axis=0)
 
-        # Calculate true log2 Fold Change
-        # Add a tiny epsilon to avoid log(0) if necessary, though log1p data handles this well.
-        epsilon = 1e-9
-        true_logfc = np.log2((mean_pert_true + 1e-9) / (mean_control_true + 1e-9))
-        
-        # Calculate true p-values using Wilcoxon (Mann-Whitney U)
-        _, true_pvals = stats.mannwhitneyu(X_pert_true, X_control_true, axis=0, alternative='two-sided')
-        
-        # Apply FDR Correction
-        _, true_pvals_adj, _, _ = multipletests(true_pvals, alpha=fdr_thresh, method='fdr_bh')
+# ----------------------------------------------------------------------------
+# AUPRC
+# ----------------------------------------------------------------------------
 
-        # Define Ground Truth Indicator Z (1 if DE, 0 if not) using paper's thresholds: p < p_thresh and |logFC| > logfc_thresh
-        Z_true = ((true_pvals_adj < fdr_thresh) & (np.abs(true_logfc) > logfc_thresh)).astype(int)
-        
-        # predicted DEGs (In Silico vs In Vitro Control) ---
-        mask_pert_pred = adata_pred.obs[pert_col] == pert
-        X_pert_pred = adata_pred[mask_pert_pred].X.toarray() if hasattr(adata_pred.X, 'toarray') else adata_pred[mask_pert_pred].X
-        #mean_pert_pred = np.mean(X_pert_pred, axis=0)
-        mean_pert_pred = np.mean(np.expm1(X_pert_pred), axis=0)
+# this is just to densify the count matrix
+def _dense(X):
+    X = X.toarray() if sparse.issparse(X) else np.asarray(X)
+    return np.ascontiguousarray(X, dtype=np.float32)
 
-        # Calculate predicted log2 Fold Change
-        pred_logfc = np.log2((mean_pert_pred + 1e-9) / (mean_control_true + 1e-9))
-        
-        # Calculate predicted p-values using Wilcoxon
-        _, pred_pvals = stats.mannwhitneyu(X_pert_pred, X_control_true, axis=0, alternative='two-sided')
 
-        # Apply FDR Correction
-        _, pred_pvals_adj, _, _ = multipletests(pred_pvals, alpha=fdr_thresh, method='fdr_bh')
-        
-        # Calculate Ranking Score R_g = |predicted_logFC| * Indicator(predicted_pval < p_thresh)
-        indicator_pred = (pred_pvals_adj < fdr_thresh).astype(int)
-        R_score = np.abs(pred_logfc) * indicator_pred
+def _mean_expm1(X):
+    """
+    Per-gene arithmetic mean in linear space of log1p data (dense or sparse).
+    """
+    if sparse.issparse(X):
+        return np.asarray(X.expm1().mean(axis=0, dtype=np.float64)).ravel()
+    return np.expm1(X).mean(axis=0, dtype=np.float64)
 
-        # Handle edge cases where there are no true DEGs for a perturbation
-        if np.sum(Z_true) == 0:
-            print(f"Skipping {pert}: 0 Ground Truth DEGs found.")
+
+def _logfc(X_pert, mean_ctrl, eps=1e-9):
+    """log2 fold change of mean(expm1(x)) between perturbed cells and a precomputed control mean.
+    Single logFC definition shared by AUPRC and DES (F1 / precision)."""
+    return np.log2((_mean_expm1(X_pert) + eps) / (mean_ctrl + eps))
+
+
+class _ControlContext:
+    """
+    Everything about the control cells that does not depend on the perturbation (computed once).
+
+    self.mean = pseudobulk in linear space
+    self.det = pseudobulk in log space
+    self.sorted, self.tie = sorting for wilcoxon (to be done only once)
+    """
+    def __init__(self, X_ctrl):  # dense float32 (n_ctrl, G)
+        self.mean = _mean_expm1(X_ctrl)
+        self.det = (X_ctrl > 0).mean(axis=0)
+        self.sorted, self.tie = prepare_control(X_ctrl)
+
+
+def _de_stats(X_pert, ctrl, eps=1e-9):
+    """
+    One perturbation vs. control (Wilcoxon + BH-FDR + logFC). X_pert: dense float32 (n1, G).
+    """
+    pvals, z = mwu_vs_sorted_control(X_pert, ctrl.sorted, ctrl.tie)
+    return {
+        "scores": z,
+        "pvals": pvals,
+        "pvals_adj": false_discovery_control(pvals, method="bh"),
+        "logfoldchanges": _logfc(X_pert, ctrl.mean, eps),
+        "pct_cells": (X_pert > 0).mean(axis=0),
+    }
+
+
+def _eligible(pct_pert, pct_ctrl, min_cell_fraction):
+    """
+    Genes detected in more than `min_cell_fraction` of the perturbed OR the control cells.
+    """
+    if not min_cell_fraction:
+        return np.ones(len(pct_pert), dtype=bool)
+    return np.maximum(pct_pert, pct_ctrl) > min_cell_fraction
+
+
+def _deg_mask(st, eligible, lfc_threshold, alpha):
+    """
+    THE definition of a DEG, shared by the DES metrics, AUPRC and the top-DEG selection.
+    """
+    return ((np.asarray(st["pvals_adj"]) < alpha)
+            & (np.abs(np.asarray(st["logfoldchanges"])) > lfc_threshold)
+            & np.asarray(eligible, dtype=bool))
+
+
+def calc_auprc(
+    adata_true,
+    adata_pred,
+    pert_col="target_gene",
+    control_name="non-targeting",
+    fdr_thresh=DEG_ALPHA,
+    logfc_thresh=DEG_LFC_THRESHOLD,
+    min_cell_fraction=DEG_MIN_CELL_FRACTION,
+    n_jobs=None,
+    eps=1e-9,
+    true_labels=None,
+    return_labels=False,
+):
+    """
+    DEG-recovery AUPRC (average precision) per perturbation. Assumes log1p X.
+
+    DEGs (ground truth) are defined exactly as in the DES metrics (same kernel, logFC and filter).
+    Gene eligibility (detected in > min_cell_fraction of the perturbed or control cells) is decided on
+    the REAL data only and applied to both truth and predictions: ineligible genes are removed from
+    the evaluation (labels, scores and baseline), so the filter does not depend on how the model
+    parametrises its output (continuous predictions would otherwise always be "detected").
+
+    n_jobs        number of numba threads (default: $SLURM_CPUS_PER_TASK, else all cores).
+    true_labels   dict filled in place with {pert: (DEG labels, eligible mask)} over the common
+                  genes. Ground truth does not depend on the model: pass the same dict for
+                  every model to compute it once.
+    """
+    if n_jobs is None:
+        n_jobs = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
+    numba.set_num_threads(max(1, min(n_jobs, numba.config.NUMBA_NUM_THREADS)))
+
+    common = adata_true.var_names.intersection(adata_pred.var_names)
+    ti = adata_true.var_names.get_indexer(common)
+    pi = adata_pred.var_names.get_indexer(common)
+    true_groups = adata_true.obs.groupby(pert_col, observed=True).indices
+    pred_groups = adata_pred.obs.groupby(pert_col, observed=True).indices
+    if control_name not in true_groups:
+        raise ValueError(f"Control '{control_name}' not found in adata_true.")
+
+    X_true, X_pred = adata_true.X, adata_pred.X
+
+    # Observed control (predictions are also compared against it): prepared ONCE
+    ctrl = _ControlContext(_dense(X_true[true_groups[control_name]][:, ti]))
+
+    perts = [p for p in true_groups if p != control_name]
+
+    # Ground truth (model-independent -> cacheable)
+    if true_labels is None:
+        true_labels = {}
+    todo = [p for p in perts if p not in true_labels]
+    for pert in tqdm(todo, desc="Ground-truth DEGs", disable=not todo):
+        st = _de_stats(_dense(X_true[true_groups[pert]][:, ti]), ctrl, eps)
+        elig = _eligible(st["pct_cells"], ctrl.det, min_cell_fraction)
+        true_labels[pert] = (_deg_mask(st, elig, logfc_thresh, fdr_thresh).astype(np.uint8), elig)
+
+    # Predictions
+    model_results, baseline_results = {}, {}
+    for pert in tqdm(perts, desc="Calculating AUPRC"):
+        Z, elig = true_labels[pert]
+        if len(Z) != len(common):
+            raise ValueError("cached true_labels were computed on a different gene set")
+        n_degs = int(Z.sum())  # Z already implies eligible
+        if n_degs == 0 or pert not in pred_groups:
             continue
+        st = _de_stats(_dense(X_pred[pred_groups[pert]][:, pi]), ctrl, eps)
+        R = np.abs(st["logfoldchanges"]) * (st["pvals_adj"] < fdr_thresh)
+        model_results[pert] = average_precision_score(Z[elig], R[elig])
+        baseline_results[pert] = n_degs / int(elig.sum())
 
-        model_results[pert] = average_precision_score(Z_true, R_score)
-        
-        # Calculate Baseline AUPRC (Number of DEGs / Total Genes)
-        baseline_results[pert] = np.sum(Z_true) / len(Z_true)
-    
-    print("\n--- Summary ---")
-    print(f"Average Baseline AUPRC: {sum(baseline_results.values())/len(baseline_results):.4f}")
-    print(f"Average Model AUPRC:    {sum(model_results.values())/len(model_results):.4f}")
-    
-    return model_results
+    print(f"Perturbations scored: {len(model_results)}/{len(perts)}")
+    print(f"Average baseline AUPRC: {np.mean(list(baseline_results.values())):.4f}")
+    print(f"Average model AUPRC:    {np.mean(list(model_results.values())):.4f}")
+    return (model_results, true_labels) if return_labels else model_results
+
 
 ########################################################
 ################## BENCHMARK METRICS ###################
@@ -374,10 +597,83 @@ def subsample_groups(adata, n_samples=1000):
     
     return ad.concat([adata_control, adata_stimulated, adata_imputed])
 
+# Ground-truth top DEGs: depend ONLY on the real data -> compute once, cache on disk
+def compute_top_degs(
+    adata_true,
+    n_top_degs,
+    control_tag='non-targeting',
+    condition_col='target_gene',
+    lfc_threshold=DEG_LFC_THRESHOLD,
+    alpha=DEG_ALPHA,
+    min_cell_fraction=DEG_MIN_CELL_FRACTION
+):
+    """
+    Ground-truth DEGs of every perturbation, defined exactly as in the DES metrics (RobustDES:
+    Wilcoxon, BH-FDR < alpha, |log2FC| > lfc_threshold, logFC = log2 ratio of mean(expm1),
+    gene detected in > min_cell_fraction of perturbed or control cells).
+    Among the genes passing BOTH thresholds, the `n_top_degs` with the largest |Wilcoxon score| are kept.
+    A perturbation can therefore have fewer than n_top_degs genes (or none).
+    Returns {pert: [gene names]}.
+    """
+    des_calculator = RobustDES(lfc_threshold=lfc_threshold, alpha=alpha, min_cell_fraction=min_cell_fraction)
+    perts = [p for p in adata_true.obs[condition_col].unique() if p != control_tag]
+    top = {}
+    for pert in tqdm(perts, desc='Calculating ground-truth DE genes...'):
+        # get_de_genes returns (thresholded DEGs, full table); [1] alone would ignore the thresholds
+        de_df, full_df = des_calculator.get_de_genes(adata_true, condition_col, pert, control_tag)
+
+        # sel = full_df[full_df['names'].isin(de_df.index)]
+        order = full_df['scores'].abs().sort_values(ascending=False, kind='stable').index[:n_top_degs]
+        top[str(pert)] = full_df.loc[order, 'names'].tolist()
+    return top
+
+
+def load_or_compute_top_degs(adata_true, n_top_degs, cache_path, fingerprint=None,
+                             control_tag='non-targeting', condition_col='target_gene',
+                             lfc_threshold=DEG_LFC_THRESHOLD, alpha=DEG_ALPHA,
+                             min_cell_fraction=DEG_MIN_CELL_FRACTION):
+    """
+    Loads {pert: [genes]} from `cache_path` if it was made with the same settings/data
+    (checked through a small metadata block), otherwise computes it and writes the cache.
+    """
+
+    meta = {
+        "n_top_degs": int(n_top_degs), 
+        "control_tag": control_tag, 
+        "condition_col": condition_col,
+        "n_obs": int(adata_true.n_obs), 
+        "n_vars": int(adata_true.n_vars),
+        "fingerprint": fingerprint, 
+        "lfc_threshold": lfc_threshold,
+        "alpha": alpha,
+        "min_cell_fraction": min_cell_fraction,
+        "criterion": "des_fast_wilcoxon_either_group_min_pct_top_abs_z"
+    }
+
+    if os.path.exists(cache_path):
+        with open(cache_path) as f:
+            cached = json.load(f)
+        if cached.get("meta") == meta:
+            print(f"[*] Loaded top-{n_top_degs} DEGs from cache: {cache_path}")
+            return cached["top_degs"]
+        print(f"[!] DEG cache {cache_path} does not match current data/settings: recomputing")
+    top = compute_top_degs(adata_true, n_top_degs, control_tag, condition_col, lfc_threshold, alpha, min_cell_fraction)
+    try:
+        tmp = cache_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"meta": meta, "top_degs": top}, f)
+        os.replace(tmp, cache_path)  # atomic: safe with parallel jobs
+        print(f"[*] Saved top-{n_top_degs} DEGs to: {cache_path}")
+    except OSError as e:
+        print(f"[!] Could not write DEG cache ({e}); continuing without it")
+    return top
+
+
 # Metric Evaluator Wrapper (Iterates over Perturbations)
-def evaluate_metric_per_perturbation(adata_true, adata_pred, metric_func, control_tag='non-targeting', condition_col='target_gene', n_top_degs=None, **kwargs):
+def evaluate_metric_per_perturbation(adata_true, adata_pred, metric_func, control_tag='non-targeting', condition_col='target_gene', top_degs=None, **kwargs):
     """
     General wrapper that runs a given metric function for each individual perturbation.
+    top_degs: optional {pert: [genes]} (see compute_top_degs); if given, each perturbation is evaluated on its genes only.
     """
 
     # new column "Expcategory" in .obs: "control" for control cells, 'stimulated' for gt, 'imputed' for predictions  
@@ -398,28 +694,13 @@ def evaluate_metric_per_perturbation(adata_true, adata_pred, metric_func, contro
             results[pert] = np.nan
             continue
 
-        if n_top_degs is not None:
-
-            # Need categorical dtype for scanpy rank_genes_groups
-            adata_sub.obs['Expcategory'] = adata_sub.obs['Expcategory'].astype('category')
-            
-            # Isolate the true ground truth data (stimulated vs control)
-            adata_true_sub = adata_sub[adata_sub.obs['Expcategory'].isin(['stimulated', 'control'])].copy()
-            
-            # Calculate DEGs using standard t-test as per benchmark
-            sc.tl.rank_genes_groups(adata_true_sub, groupby='Expcategory', reference='control', method='wilcoxon')
-            
-            # Extract top N genes by absolute score
-            res_true = adata_true_sub.uns['rank_genes_groups']
-            df_true = pd.DataFrame({'names': res_true['names']['stimulated'], 'scores': res_true['scores']['stimulated']})
-            top_true_degs = list(df_true.assign(abs_scores=df_true['scores'].abs()).sort_values('abs_scores', ascending=False).head(n_top_degs)['names'])
-            
-            # Subset the working object to only these top N genes
-            adata_sub = adata_sub[:, top_true_degs].copy()
-        
-        # # except for DEGs overlap metrics we remove control cells (casuse they are they are always the ground truth)
-        # if metric_func not in ['_core_common_degs']:
-        #     adata_sub = adata_sub[adata_sub.obs['Excategory']!='control']
+        if top_degs is not None:
+            # restrict to this perturbation's (precomputed) ground-truth DEGs
+            genes = [g for g in _degs_for(top_degs, pert) if g in adata_sub.var_names]
+            # if len(genes) < MIN_DEG_GENES:  # too few DEGs for a meaningful score
+            #     results[pert] = np.nan
+            #     continue
+            adata_sub = adata_sub[:, genes].copy()
 
         # Calculate metric
         with SuppressOutput():
@@ -498,20 +779,21 @@ def _core_common_degs(adata_sub, top_n=50):
     return round(len(top_true_degs.intersection(top_pred_degs)) / len(top_true_degs), 4)
 
 # End-User Functions - to be called directly
-def calc_mse(adata_true, adata_pred, control_tag='non-targeting', condition_col='target_gene', n_top_degs=None):
-    return evaluate_metric_per_perturbation(adata_true, adata_pred, _core_mse, control_tag, condition_col, n_top_degs=n_top_degs)
+# top_degs: optional {pert: [genes]}
+def calc_mse(adata_true, adata_pred, control_tag='non-targeting', condition_col='target_gene', top_degs=None):
+    return evaluate_metric_per_perturbation(adata_true, adata_pred, _core_mse, control_tag, condition_col, top_degs=top_degs)
 
-def calc_pcc_delta(adata_true, adata_pred, control_tag='non-targeting', condition_col='target_gene', n_top_degs=None):
-    return evaluate_metric_per_perturbation(adata_true, adata_pred, _core_pcc_delta, control_tag, condition_col, n_top_degs=n_top_degs)
+def calc_pcc_delta(adata_true, adata_pred, control_tag='non-targeting', condition_col='target_gene', top_degs=None):
+    return evaluate_metric_per_perturbation(adata_true, adata_pred, _core_pcc_delta, control_tag, condition_col, top_degs=top_degs)
 
-def calc_edistance(adata_true, adata_pred, control_tag='non-targeting', condition_col='target_gene', n_top_degs=None, do_subsample=True):
-    return evaluate_metric_per_perturbation(adata_true, adata_pred, _core_edistance, control_tag, condition_col, n_top_degs=n_top_degs, do_subsample=do_subsample)
+def calc_edistance(adata_true, adata_pred, control_tag='non-targeting', condition_col='target_gene', top_degs=None, do_subsample=True):
+    return evaluate_metric_per_perturbation(adata_true, adata_pred, _core_edistance, control_tag, condition_col, top_degs=top_degs, do_subsample=do_subsample)
 
-def calc_wasserstein(adata_true, adata_pred, control_tag='non-targeting', condition_col='target_gene', n_top_degs=None , do_subsample=True):
-    return evaluate_metric_per_perturbation(adata_true, adata_pred, _core_wasserstein, control_tag, condition_col, n_top_degs=n_top_degs, do_subsample=do_subsample)
+def calc_wasserstein(adata_true, adata_pred, control_tag='non-targeting', condition_col='target_gene', top_degs=None, do_subsample=True):
+    return evaluate_metric_per_perturbation(adata_true, adata_pred, _core_wasserstein, control_tag, condition_col, top_degs=top_degs, do_subsample=do_subsample)
 
-def calc_kldiv(adata_true, adata_pred, control_tag='non-targeting', condition_col='target_gene', n_top_degs=None, do_subsample=True):
-    return evaluate_metric_per_perturbation(adata_true, adata_pred, _core_kldiv, control_tag, condition_col, n_top_degs=n_top_degs, do_subsample=do_subsample)
+def calc_kldiv(adata_true, adata_pred, control_tag='non-targeting', condition_col='target_gene', top_degs=None, do_subsample=True):
+    return evaluate_metric_per_perturbation(adata_true, adata_pred, _core_kldiv, control_tag, condition_col, top_degs=top_degs, do_subsample=do_subsample)
 
 def calc_common_degs(adata_true, adata_pred, control_tag='non-targeting', condition_col='target_gene', top_n=100):
-    return evaluate_metric_per_perturbation(adata_true, adata_pred, _core_common_degs, control_tag, condition_col, n_top_degs=None, top_n=top_n)
+    return evaluate_metric_per_perturbation(adata_true, adata_pred, _core_common_degs, control_tag, condition_col, top_degs=None, top_n=top_n)

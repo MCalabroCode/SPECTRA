@@ -1,0 +1,32 @@
+project:
+  name: "SPECTRA_rpe1"
+  seed: 42
+  deterministic: False
+  use_wandb: True
+
+data:
+  adata_path: "/group/sottoriva/michele.calabro/SPECTRA/data/rep_rpe1/replogle_rpe1_medium_filtered.h5ad"
+  gene_list_path: "/group/sottoriva/michele.calabro/SPECTRA/data/rep_rpe1/gene_list.txt"
+  network_path: "/group/sottoriva/michele.calabro/SPECTRA/data/rep_rpe1/rpe_network.tsv"
+  scgpt_embeddings_path: "/group/sottoriva/michele.calabro/SPECTRA/data/rep_rpe1/scGPT_embeddings_all_genes.pkl"
+  gene_weights_path: "/group/sottoriva/michele.calabro/SPECTRA/data/rep_rpe1/gene_weights-rpe1.pkl"
+  split_path: "/group/sottoriva/michele.calabro/SPECTRA/data/rep_rpe1/ref_b_matched_perturbation_splits.json"
+
+model:
+  architecture: "wilx_vsrest_enhanced_medium_filtering"
+  conv_type: 'FAGCN'
+  residual_weight: 0.7
+  n_channels: 24
+  dropout_p: 0.4
+  num_node_features: 1
+
+training:
+  batch_size: 16
+  lr: 0.001
+  n_epochs: 20
+  alpha: 1.9
+  beta: 0.0001
+  gamma: 0.5
+  test_ratio: 0.2
+  val_ratio: 0.1
+  weights_folder_path: "/group/sottoriva/michele.calabro/SPECTRA/weights"

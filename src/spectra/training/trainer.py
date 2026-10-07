@@ -12,12 +12,17 @@ import wandb
 import os
 import uuid
 from collections import defaultdict
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim import Optimizer
 
 
 # Absolute imports from the spectra package
 from spectra.evaluation.metrics import calc_auprc
-from spectra.training.losses import _get_beta_schedule, compute_mmd_withcosine, compute_mmd, compute_weighted_energy_distance
-#from losses import _get_beta_schedule, compute_mmd_withcosine, compute_mmd
+from spectra.training.losses import (_get_beta_schedule, 
+        compute_mmd_gaussian, 
+        compute_mmd_energy_distance, 
+        compute_mmd_energy_genewise
+)
 
 def train_step_perturb_model(model, data, device, alpha=1., beta=1., gamma=1., eta=1.):
     x, y, pert, pert_idx = data  # x,y: [B,N,1], pert: [B,N]
@@ -60,29 +65,24 @@ def train_step_perturb_model(model, data, device, alpha=1., beta=1., gamma=1., e
     else:
         loss_cosine = torch.tensor(0.0, device=device)
     
-    #loss_mmd_y = compute_mmd_withcosine(y_true, y_pred, weights=batch_weights)
-
+    loss_mmd_y = compute_mmd_energy_distance(y_true, y_pred, weights=batch_weights)
+    # loss_mmd_genewise = compute_mmd_energy_genewise(y_true, y_pred, weights=batch_weights)
     # loss_wmse_y = torch.sum(batch_weights * (y_true_mean - y_pred_mean)**2)
 
-    loss_mmd_y = compute_weighted_energy_distance(y_true, y_pred, batch_weights)
-
-    # if mmd_gamma != 0.0:
-    #     loss_mmd_x = compute_mmd(x_true, x_pred)
-    # else:
-    #     loss_mmd_x = 0.0
-
-    total_loss = (alpha * control_loss_feat 
-                + beta * kl_div 
-                + gamma * loss_mmd_y 
-                # + eta * loss_wmse_y
-                + loss_cosine
+    total_loss = (
+        alpha * control_loss_feat 
+        + beta * kl_div 
+        + gamma * loss_mmd_y 
+        + eta * loss_cosine
     )
 
     return total_loss, kl_div, loss_mmd_y, loss_cosine, control_loss_feat
 
 @torch.no_grad()
 def test_perturb_model(model, loader, device):
-
+    '''
+    old testing routine
+    '''
     model.eval()
     pert_mmd = []
     pert_wmse = []
@@ -115,7 +115,7 @@ def test_perturb_model(model, loader, device):
     return avg_pert_mmd, avg_pert_wmse
 
 @torch.no_grad()
-def test_perturb_model_pseudobulk(model, loader, device, compute_mmd_fn=compute_weighted_energy_distance):
+def test_perturb_model_pseudobulk(model, loader, device, compute_mmd_fn=compute_mmd_energy_distance):
     '''
     NOTE: this is the correct code, fully compatible with what written in "Adressing mode collapse"; here, pseudobulk
     is calculated over all perturbation samples, not just minibatches
@@ -263,6 +263,54 @@ def final_val_AUPRC(model, loader, device, var_names):
 
     return average
 
+def build_warmup_cosine_scheduler(
+    optimizer: Optimizer,
+    peak_lr: float,
+    total_steps: int,
+    warmup_frac: float = 0.03,
+    min_lr_frac: float = 0.10,
+) -> SequentialLR:
+    """
+    Build a linear-warmup -> cosine-annealing LR scheduler.
+ 
+    Args:
+        optimizer: optimizer whose param groups already have
+            lr == peak_lr set at construction time (all groups must
+            share the same base lr).
+        peak_lr: the lr reached at the end of warmup.
+        total_steps: total number of optimizer.step() calls over the
+            whole run (num_epochs * steps_per_epoch).
+        warmup_frac: fraction of total_steps spent in linear warmup.
+        min_lr_frac: cosine floor, as a fraction of peak_lr.
+ 
+    Returns:
+        A SequentialLR. Call .step() once per training step (right
+        after optimizer.step()).
+    """
+    if not 0.0 < warmup_frac < 1.0:
+        raise ValueError(f"warmup_frac must be in (0, 1), got {warmup_frac}")
+    if not 0.0 <= min_lr_frac <= 1.0:
+        raise ValueError(f"min_lr_frac must be in [0, 1], got {min_lr_frac}")
+ 
+    warmup_steps = max(1, round(total_steps * warmup_frac))
+    cosine_steps = max(1, total_steps - warmup_steps)
+ 
+    warmup = LinearLR(
+        optimizer,
+        start_factor=1e-2,  # avoid a literal 0-lr (wasted) first step
+        end_factor=1.0,
+        total_iters=warmup_steps,
+    )
+    cosine = CosineAnnealingLR(
+        optimizer,
+        T_max=cosine_steps,
+        eta_min=min_lr_frac * peak_lr,
+    )
+ 
+    return SequentialLR(
+        optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps]
+    )
+
 def train(model, 
     train_loader, 
     test_loader, 
@@ -278,11 +326,12 @@ def train(model,
     """
 
     # estract hyperparameters from model.config
-    lr = model.config['lr']
+    peak_lr = model.config['lr']
     n_epochs = model.config['n_epochs'] 
     alpha_weight = model.config['alpha'] 
     beta_weight = model.config['beta'] 
     gamma_weight = model.config['gamma'] 
+    eta_weight = model.config['eta']
 
     global_loss = []
     mmd_pert = []
@@ -292,9 +341,40 @@ def train(model,
 
     first_batch = next(iter(train_loader))
     batch_size = first_batch[0].shape[0]
+    steps_per_epoch = len(train_loader)
+    total_steps = n_epochs * steps_per_epoch
 
-    accumulation_steps = 1
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, fused=True, weight_decay=0.0)
+    decay_params = []
+    no_decay_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        # Exclude all 1D tensors (biases, normalization scale/shift, scalars)
+        # as well as FiLM modulation vectors and FAGCN gate parameters
+        if (
+            param.ndim <= 1
+            or any(k in name.lower() for k in ("bias", "norm", "film", "gate", "alpha"))
+        ):
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": decay_params, "weight_decay": 1e-4},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=peak_lr,
+    )
+    # optimizer = torch.optim.Adam(
+    #     model.parameters(), lr=peak_lr, fused=True, weight_decay=0.0
+    # )
+
+    scheduler = build_warmup_cosine_scheduler(
+        optimizer, peak_lr=peak_lr, total_steps=total_steps
+    )
 
     # for FAGCN convolution, pre-calculated in-degree, out-degree and reverse edge index
     if model.conv_type == 'FAGCN':
@@ -338,7 +418,8 @@ def train(model,
                 model.device, 
                 alpha=alpha_weight, 
                 beta=beta_weight,
-                gamma=gamma_weight)
+                gamma=gamma_weight,
+                eta=eta_weight)
 
             loss.backward()
 
@@ -349,11 +430,17 @@ def train(model,
             kl_accum += kl_div.item()
             mse_accum += loss_feat.item()
             cos_accum += loss_cosine.item()
+
+            # gradient clipping
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=1.0,
+                error_if_nonfinite=True,
+            )
             
-            # gradient accumulation
-            if (i+1)%accumulation_steps==0:
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+            optimizer.step()
+            scheduler.step() 
+            optimizer.zero_grad(set_to_none=True)
 
         # calculate averages for the epoch
         epoch_loss = total_loss / len(train_loader)
@@ -378,7 +465,6 @@ def train(model,
         # Validation & Early Stopping
         if epoch!=0:
 
-            # We assume this returns your primary metric (MMD)
             _, avg_weighted_pert_wmse, avg_pert_wmse = test_perturb_model_pseudobulk(model, test_loader, device, compute_mmd_fn=None)
             test_wmse.append(avg_pert_wmse)
             test_weighted_wmse.append(avg_weighted_pert_wmse)

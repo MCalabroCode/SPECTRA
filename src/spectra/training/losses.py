@@ -41,11 +41,12 @@ def _get_beta_schedule(epoch, n_epochs, warmup_epochs=5, n_cycles=1, ratio=0.5):
     else:
         return 1.0
 
-def compute_mmd_withcosine(x, y, weights=None, kernel_mul=2.0, kernel_num=5, fix_sigma=None, lambda_cos=0.0):
+def compute_mmd_gaussian(x, y, weights=None, kernel_mul=2.0, kernel_num=10, fix_sigma=None):
     """
-    Computes the Maximum Mean Discrepancy (MMD) between two batches.
-    Uses a composite kernel: (1 - lambda_cos) * Multi-RBF + lambda_cos * Cosine
+    Computes the Maximum Mean Discrepancy (MMD) between two batches,
+    using a multi-scale RBF kernel by averaging multiple bandwiths.
     """
+
     assert x.shape == y.shape, "real and predicted batches do not match in size."
 
     batch_size = x.size(0)
@@ -56,99 +57,35 @@ def compute_mmd_withcosine(x, y, weights=None, kernel_mul=2.0, kernel_num=5, fix
 
     total = torch.cat([x, y], dim=0)
     
-    # ---------------------------------------------------------
-    # 1. RBF Kernel Calculation (Spatial)
-    # ---------------------------------------------------------
+    # RBF Kernel Calculation (Spatial)
     if weights is not None:
         # Scale features so that squared L2 distance naturally becomes WMSE
         total_scaled = total * torch.sqrt(weights.unsqueeze(0))
     else:
         total_scaled = total
     L2_distance = torch.cdist(total_scaled, total_scaled, p=2)**2
-    #L2_distance = torch.cdist(total, total, p=2)**2
     
     if fix_sigma:
         bandwidth = fix_sigma
     else:
         # Add epsilon to prevent bandwidth collapse if samples are identical
-        bandwidth = torch.sum(L2_distance.detach()) / (n_samples**2 - n_samples)# + 1e-5
+        bandwidth = torch.sum(L2_distance.detach()) / (n_samples**2 - n_samples) + 1e-5
         
     bandwidth /= kernel_mul ** (kernel_num // 2)
     bandwidth_list = [bandwidth * (kernel_mul**i) for i in range(kernel_num)]
     
     kernel_rbf = sum([torch.exp(-L2_distance / bw) for bw in bandwidth_list])
     
-    # ---------------------------------------------------------
-    # 2. Cosine Kernel Calculation (Angular)
-    # ---------------------------------------------------------
-    if lambda_cos > 0.0:
-        # Normalize each sample vector to length 1
-        total_norm = F.normalize(total, p=2, dim=1, eps=1e-8)
-        # Pairwise cosine similarity is just the dot product of normalized vectors
-        kernel_cos = torch.mm(total_norm, total_norm.t())
-        
-        # Scale Cosine to [0, 1] to match RBF scale (optional but stabilizes lambda)
-        kernel_cos = (kernel_cos + 1.0) / 2.0
-        
-        # Blend the kernels
-        kernel_val = (1.0 - lambda_cos) * kernel_rbf + (lambda_cos * kernel_cos)
-    else:
-        kernel_val = kernel_rbf
-
-    # ---------------------------------------------------------
-    # 3. MMD Calculation
-    # ---------------------------------------------------------
-    XX = kernel_val[:batch_size, :batch_size]
-    YY = kernel_val[batch_size:, batch_size:]
-    XY = kernel_val[:batch_size, batch_size:]
-    YX = kernel_val[batch_size:, :batch_size]
-    
-    loss = torch.mean(XX + YY - XY - YX)
-    return loss
-
-def compute_mmd(x, y, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
-    """
-    Computes the Maximum Mean Discrepancy (MMD) between two batches of samples x and y.
-    Uses a multi-scale RBF kernel by averaging multiple bandwiths.
-    """
-
-    assert x.shape == y.shape, "real and predicted batches do not match in size."
-
-    batch_size = x.size(0)
-    n_samples = int(x.size(0)) + int(y.size(0))
-    
-    # If not enough samples to compute distribution statistics, return 0 or simple distance
-    if batch_size <= 1:
-        return torch.tensor(0.0, device=x.device)
-
-    total = torch.cat([x, y], dim=0)
-    
-    # L2 Distance Matrix
-    L2_distance = torch.cdist(total, total, p=2)**2
-    
-    # Bandwidth selection
-    if fix_sigma:
-        bandwidth = fix_sigma
-    else:
-        bandwidth = torch.sum(L2_distance.detach()) / (n_samples**2 - n_samples) + 1e-5
-    bandwidth /= kernel_mul ** (kernel_num // 2)
-    bandwidth_list = [bandwidth * (kernel_mul**i) for i in range(kernel_num)]
-    
-    # multiple kernels calculation + averaging
-    kernel_val = [torch.exp(-L2_distance / bandwidth_temp) for bandwidth_temp in bandwidth_list]
-    kernel_val = sum(kernel_val)
-
     # MMD Calculation
-    XX = kernel_val[:batch_size, :batch_size]
-    YY = kernel_val[batch_size:, batch_size:]
-    XY = kernel_val[:batch_size, batch_size:]
-    YX = kernel_val[batch_size:, :batch_size]
+    XX = kernel_rbf[:batch_size, :batch_size]
+    YY = kernel_rbf[batch_size:, batch_size:]
+    XY = kernel_rbf[:batch_size, batch_size:]
+    YX = kernel_rbf[batch_size:, :batch_size]
     
     loss = torch.mean(XX + YY - XY - YX)
     return loss
 
-
-def compute_weighted_energy_distance(x, y, weights):
+def compute_mmd_energy_distance(x, y, weights):
 
     # If not enough samples to compute distribution statistics
     if x.size(0) <= 1:
@@ -169,3 +106,42 @@ def compute_weighted_energy_distance(x, y, weights):
     
     # Energy distance formula
     return 2 * d_xy - d_xx - d_yy
+
+def compute_mmd_energy_genewise(x, y, weights):
+    """
+    Weighted gene-wise Energy Distance.
+    """
+    B, G = x.shape
+
+    assert y.shape == x.shape
+    assert weights.shape == (G,)
+    chunk_size = 256
+
+    # scalar - inherits x’s dtype and device 
+    loss = x.new_zeros(())
+
+    for start in range(0,G, chunk_size):
+
+        end = min(start + chunk_size, G)
+        x_chunk = x[:, start:end]          # [B, C]
+        y_chunk = y[:, start:end]          # [B, C]
+        w_chunk = weights[start:end]       # [C]
+
+        # NOTE: None in position h is equivalent to unsqueeze(1) 
+        # "mean(dim=(0, 1))" returns average for every gene in C
+        d_xy = torch.abs(
+            x_chunk[:, None, :] - y_chunk[None, :, :]
+        ).mean(dim=(0, 1))
+
+        d_xx = torch.abs(
+            x_chunk[:, None, :] - x_chunk[None, :, :]
+        ).mean(dim=(0, 1))
+
+        d_yy = torch.abs(
+            y_chunk[:, None, :] - y_chunk[None, :, :]
+        ).mean(dim=(0, 1))
+
+        gene_ed = 2 * d_xy - d_xx - d_yy
+        loss = loss + torch.sum(w_chunk * gene_ed)
+        
+    return loss

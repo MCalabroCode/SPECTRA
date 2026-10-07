@@ -1,0 +1,81 @@
+project:
+  name: "SPECTRA_RPE1_sweep_correct"
+  seed: 42
+  deterministic: False
+
+data:
+  adata_path: "/group/sottoriva/michele.calabro/SPECTRA/data/rep_rpe1/replogle_rpe1_medium_filtered.h5ad"
+  gene_list_path: "/group/sottoriva/michele.calabro/SPECTRA/data/rep_rpe1/gene_list.txt"
+  network_path: "/group/sottoriva/michele.calabro/SPECTRA/data/rep_rpe1/rpe_network.tsv"
+  scgpt_embeddings_path: "/group/sottoriva/michele.calabro/SPECTRA/data/rep_rpe1/scGPT_embeddings_all_genes.pkl"
+  gene_weights_path: "/group/sottoriva/michele.calabro/SPECTRA/data/rep_rpe1/gene_weights-rpe1.pkl"
+  weights_folder_path: "/group/sottoriva/michele.calabro/SPECTRA/weights/sweep"
+  split_path: "/group/sottoriva/michele.calabro/SPECTRA/data/rep_rpe1/ref_b_matched_perturbation_splits.json"
+
+# Weights & Biases Sweep Configuration
+sweep:
+  method: bayes
+  metric:
+    name: val/test_WMSE
+    goal: minimize
+  early_terminate:
+    type: hyperband
+    min_iter: 3
+    eta: 3
+  parameters:
+    test_ratio: 
+      value: 0.2
+    val_ratio: 
+      value: 0.1
+    batch_size: 
+      values: [16, 24, 32, 48, 64]
+    n_channels: 
+      values: [16, 24, 32, 48, 64, 128]
+    
+    # Snaps to 0.0, 0.05, 0.10 ... 0.50
+    dropout_p: 
+      distribution: q_uniform
+      min: 0.0
+      max: 0.5
+      q: 0.05
+    
+    # Snaps to 0.1, 0.2, 0.3 ... 5.0
+    alpha: 
+      distribution: q_uniform
+      min: 0.1
+      max: 5.0
+      q: 0.1
+      
+    # For logarithmic searches, an explicit list gives the cleanest numbers
+    beta: 
+      values: [0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]
+      
+    # Snaps to 0.1, 0.2, 0.3 ... 5.0
+    gamma: 
+      distribution: q_uniform
+      min: 0.1
+      max: 5.0
+      q: 0.1
+      
+    # Snaps to 0.1, 0.2, 0.3 ... 5.0
+    eta: 
+      distribution: q_uniform
+      min: 0.1
+      max: 5.0
+      q: 0.1
+      
+    # Snaps to 0.0, 0.1, 0.2 ... 1.0
+    residual_weight: 
+      distribution: q_uniform
+      min: 0.0
+      max: 1.0
+      q: 0.1
+      
+    conv_type: 
+      value: 'FAGCN'
+    lr: 
+      value: 0.001
+    n_epochs: 
+      value: 20
+    architecture: 
+      value: "medium_filter_seed42_correct"

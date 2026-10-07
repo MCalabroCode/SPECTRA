@@ -5,12 +5,13 @@ import numpy as np
 import pandas as pd
 import anndata as ad
 
-def generate_from_control(gene_counts_dict, adata_control, model, gene_to_idx, batch_size=32, add_control=True):
+def generate_from_control(gene_counts_dict, adata_control, model, batch_size=32, add_control=True):
 
     prediction_list = []
     obs_gene_list = []
 
     var_names = adata_control.var_names
+    gene_to_idx = model.gene_to_idx
 
     # ctrl
     ctrl_data = adata_control.X.toarray() if hasattr(adata_control.X, "toarray") else np.asarray(adata_control.X)
