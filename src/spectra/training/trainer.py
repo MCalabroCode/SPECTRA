@@ -1,6 +1,4 @@
-'''
-training + testing routines
-'''
+"""training and testing routines"""
 
 import torch
 import torch.nn.functional as F
@@ -12,31 +10,41 @@ import wandb
 import os
 import uuid
 from collections import defaultdict
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.optim import Optimizer
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR, 
+    LinearLR, 
+    SequentialLR
+)
 
-
-# Absolute imports from the spectra package
 from spectra.evaluation.metrics import calc_auprc
-from spectra.training.losses import (_get_beta_schedule, 
+from spectra.training.losses import (
+        _get_beta_schedule, 
         compute_mmd_gaussian, 
         compute_mmd_energy_distance, 
         compute_mmd_energy_genewise
 )
 
-def train_step_perturb_model(model, data, device, alpha=1., beta=1., gamma=1., eta=1.):
-    x, y, pert, pert_idx = data  # x,y: [B,N,1], pert: [B,N]
+def train_step_perturb_model(
+    model, 
+    data, 
+    device, 
+    alpha=1., 
+    beta=1., 
+    gamma=1., 
+    eta=1.
+):
+    x, y, pert, pert_idx = data  # dim x,y: [B,N,1], pert: [B,N]
     x, y, pert = x.to(device), y.to(device), pert.to(device)
     B, N, _ = x.shape
 
-    y_hat, x_hat = model((x,pert)) #[BxN,1]
+    y_hat, x_hat = model((x,pert)) # dim [BxN,1]
     x_flat = x.reshape(B * N, 1)
     y_flat = y.reshape(B * N, 1)
 
     # control cells (x_hat): ELBO loss
-    squared_error = (x_hat - x_flat) ** 2 # [B*N,1]
+    squared_error = (x_hat - x_flat) ** 2
     control_loss_feat = squared_error.view(B, N).mean(dim=1).mean()
-
     kl_div = model.kl_loss(model.last_mu, model.last_logstd)
 
     # Cosine similarity (Direction)
@@ -52,11 +60,11 @@ def train_step_perturb_model(model, data, device, alpha=1., beta=1., gamma=1., e
     y_pred_mean = y_pred.mean(dim=0) # [N]
 
     # Extract perturbation weights for this batch
-    batch_pert_idx = pert_idx[0].item() # Guaranteed identical across the batch!
+    batch_pert_idx = pert_idx[0].item() # NOTE: identical across the batch!
     batch_weights = model.weight_lookup[batch_pert_idx] #[N]
 
     delta_true_mean = y_true_mean - x_true_mean
-    delta_pred_mean = y_pred_mean - x_true_mean #x_true_mean
+    delta_pred_mean = y_pred_mean - x_true_mean
 
     true_norm = torch.norm(delta_true_mean)
     if true_norm > 1e-6:
@@ -65,8 +73,16 @@ def train_step_perturb_model(model, data, device, alpha=1., beta=1., gamma=1., e
     else:
         loss_cosine = torch.tensor(0.0, device=device)
     
-    loss_mmd_y = compute_mmd_energy_distance(y_true, y_pred, weights=batch_weights)
-    # loss_mmd_genewise = compute_mmd_energy_genewise(y_true, y_pred, weights=batch_weights)
+    loss_mmd_y = compute_mmd_energy_distance(
+        y_true, 
+        y_pred, 
+        weights=batch_weights
+    )
+    # loss_mmd_genewise = compute_mmd_energy_genewise(
+    #     y_true, 
+    #     y_pred, 
+    #     weights=batch_weights
+    # )
     # loss_wmse_y = torch.sum(batch_weights * (y_true_mean - y_pred_mean)**2)
 
     total_loss = (
@@ -79,10 +95,8 @@ def train_step_perturb_model(model, data, device, alpha=1., beta=1., gamma=1., e
     return total_loss, kl_div, loss_mmd_y, loss_cosine, control_loss_feat
 
 @torch.no_grad()
-def test_perturb_model(model, loader, device):
-    '''
-    old testing routine
-    '''
+def _test_perturb_model_OLD(model, loader, device):
+    """ old testing routine. Do not use."""
     model.eval()
     pert_mmd = []
     pert_wmse = []
@@ -93,7 +107,6 @@ def test_perturb_model(model, loader, device):
         B = pert.shape[0]
         N = pert.shape[1]
 
-        #y_hat, _ = model((x,pert)) #[B*N,1]
         y_true = y.view(B, N)
         y_pred = model((x,pert))[0].view(B, N)
 
@@ -107,7 +120,11 @@ def test_perturb_model(model, loader, device):
         pert_wmse.append(error.item())
 
         # mmd
-        mmd_error = compute_weighted_energy_distance(y_true, y_pred, model.weight_lookup[batch_pert_idx])
+        mmd_error = compute_weighted_energy_distance(
+            y_true, 
+            y_pred, 
+            model.weight_lookup[batch_pert_idx]
+        )
         pert_mmd.append(mmd_error.item())
 
     avg_pert_mmd = sum(pert_mmd)/len(pert_mmd)
@@ -115,11 +132,20 @@ def test_perturb_model(model, loader, device):
     return avg_pert_mmd, avg_pert_wmse
 
 @torch.no_grad()
-def test_perturb_model_pseudobulk(model, loader, device, compute_mmd_fn=compute_mmd_energy_distance):
-    '''
-    NOTE: this is the correct code, fully compatible with what written in "Adressing mode collapse"; here, pseudobulk
-    is calculated over all perturbation samples, not just minibatches
-    '''
+def test_perturb_model(
+    model, 
+    loader, 
+    device, 
+    compute_mmd_fn=compute_mmd_energy_distance
+):
+    """
+    NOTE: This testing routine is fully consistent with the approach 
+    described in “Diversity by Design: Addressing Mode Collapse Improves 
+    scRNA-seq Perturbation Modeling on Well-Calibrated Metrics", Gabriel 
+    M. Mejia et al, for calculating WMSE. Here, pseudobulk is calculated 
+    across all perturbation samples rather than within individual minibatches.
+    """
+
     model.eval()
 
     sum_true = {}
@@ -140,7 +166,6 @@ def test_perturb_model_pseudobulk(model, loader, device, compute_mmd_fn=compute_
         N = pert.shape[1]
 
         y_hat, _ = model((x, pert))
-
         y_true = y.view(B, N)
         y_pred = y_hat.view(B, N)
 
@@ -151,7 +176,6 @@ def test_perturb_model_pseudobulk(model, loader, device, compute_mmd_fn=compute_
             )
 
         p = int(pert_idx[0].item())
-
         if p not in sum_true:
             sum_true[p] = torch.zeros(N, device=device)
             sum_pred[p] = torch.zeros(N, device=device)
@@ -181,18 +205,19 @@ def test_perturb_model_pseudobulk(model, loader, device, compute_mmd_fn=compute_
 
     # How well does the model perform on the average cell in this dataset?
     avg_wmse_micro = float(
-        np.average([wmse_by_pert[p] for p in wmse_by_pert], weights=[count[p] for p in wmse_by_pert],)
+        np.average(
+            [wmse_by_pert[p] for p in wmse_by_pert], 
+            weights=[count[p] for p in wmse_by_pert],
+        )
     )
 
     if compute_mmd_fn is None:
         return None, avg_wmse_micro, avg_wmse_macro
 
     mmd_by_pert = {}
-
     for p in true_cells:
         yt = torch.cat(true_cells[p], dim=0).to(device)
         yp = torch.cat(pred_cells[p], dim=0).to(device)
-
         mmd_by_pert[p] = compute_mmd_fn(yt, yp, model.weight_lookup[p]).item()
 
     avg_mmd_macro = float(np.mean(list(mmd_by_pert.values())))
@@ -210,7 +235,7 @@ def final_val_AUPRC(model, loader, device, var_names):
     
     idx_to_gene = model.idx_to_gene
 
-    # 1. Accumulate all predictions and ground truths
+    # Accumulate all predictions and ground truths
     for i, data in enumerate(tqdm(loader, desc='testing with AUPRC...')):
         x, y, pert, pert_idx = data
         x, y, pert = x.to(device), y.to(device), pert.to(device)
@@ -234,33 +259,43 @@ def final_val_AUPRC(model, loader, device, var_names):
                 obs_gene_list.append('non-targeting')
             else:
                 # Reconstruct combinatorial names if needed (e.g., 'A+B')
-                pert_name = "+".join([idx_to_gene[idx.item()] for idx in pert_indices])
+                pert_name = "+".join(
+                    [idx_to_gene[idx.item()] for idx in pert_indices]
+                )
                 obs_gene_list.append(pert_name)
 
-    # 2. Stack everything into dense numpy matrices
+    # Stack everything into dense numpy matrices
     X_pred = np.vstack(pred_expr_list)
     X_true = np.vstack(true_expr_list)
     X_ctrl = np.vstack(control_expr_list)
 
-    # 3. Build DataFrames for AnnData construction
-    obs_pert = pd.DataFrame({"target_gene": obs_gene_list})
-    obs_ctrl = pd.DataFrame({"target_gene": ['non-targeting'] * X_ctrl.shape[0]})
+    # Build DataFrames for AnnData construction
+    obs_pert = pd.DataFrame(
+        {"target_gene": obs_gene_list}
+    )
+    obs_ctrl = pd.DataFrame(
+        {"target_gene": ['non-targeting'] * X_ctrl.shape[0]}
+    )
     var = pd.DataFrame(index=var_names)
 
-    # 4. Construct the AnnData objects
+    # Construct the AnnData objects
     adata_pred = ad.AnnData(X=X_pred, obs=obs_pert.copy(), var=var)
     adata_true = ad.AnnData(X=X_true, obs=obs_pert.copy(), var=var)
     adata_ctrl = ad.AnnData(X=X_ctrl, obs=obs_ctrl, var=var)
 
-    # Concat the control cells into both datasets so the metric can compute DEGs
+    # Concat the control cells into both datasets. Needed for DEGs
     adata_pred_full = ad.concat([adata_pred, adata_ctrl])
     adata_true_full = ad.concat([adata_true, adata_ctrl])
 
-    # 5. Calculate the final dataset-wide metric!
-    # (Assuming calc_auprc returns a single float score)
-    auprc_score = calc_auprc(adata_true_full, adata_pred_full, pert_col='target_gene', control_name='non-targeting')
-    average = sum(auprc_score.values()) / len(auprc_score)
+    # Calculate the final dataset-wide AUPRC metric
+    auprc_score = calc_auprc(
+        adata_true_full, 
+        adata_pred_full, 
+        pert_col='target_gene', 
+        control_name='non-targeting'
+    )
 
+    average = sum(auprc_score.values()) / len(auprc_score)
     return average
 
 def build_warmup_cosine_scheduler(
@@ -297,7 +332,7 @@ def build_warmup_cosine_scheduler(
  
     warmup = LinearLR(
         optimizer,
-        start_factor=1e-2,  # avoid a literal 0-lr (wasted) first step
+        start_factor=1e-2,
         end_factor=1.0,
         total_iters=warmup_steps,
     )
@@ -321,8 +356,10 @@ def train(model,
     metric_mode='min'
 ):
     """
-    metric_mode: Set to 'max' if your validation metric is AUPRC/Accuracy (higher is better). 
-                 Set to 'min' if your validation metric is MMD/MSE/Loss (lower is better).
+    metric_mode: Set to 'max' if your validation metric is AUPRC/Accuracy 
+                (higher is better). 
+                Set to 'min' if your validation metric is MMD/MSE/Loss 
+                (lower is better).
     """
 
     # estract hyperparameters from model.config
@@ -376,7 +413,8 @@ def train(model,
         optimizer, peak_lr=peak_lr, total_steps=total_steps
     )
 
-    # for FAGCN convolution, pre-calculated in-degree, out-degree and reverse edge index
+    # for FAGCN convolution, pre-calculated in-degree, 
+    # out-degree and reverse edge index
     if model.conv_type == 'FAGCN':
         _precompute_n = batch_size * model.num_nodes
         _precompute_edge = model._get_batched_edge_index(batch_size)
@@ -392,9 +430,15 @@ def train(model,
     best_val_metric = float('-inf') if metric_mode == 'max' else float('inf')
     patience_counter = 0
     if wandb_support and wandb.run is not None:
-        best_filepath = os.path.join(weights_dir,f"best_model_{model.architecture_name}_{wandb.run.id}.pth")
+        best_filepath = os.path.join(
+            weights_dir,
+            f"best_model_{model.architecture_name}_{wandb.run.id}.pth"
+        )
     else:
-        best_filepath = os.path.join(weights_dir, f"best_model_{model.architecture_name}_{uuid.uuid4().hex}.pth")
+        best_filepath = os.path.join(
+            weights_dir, 
+            f"best_model_{model.architecture_name}_{uuid.uuid4().hex}.pth"
+        )
 
     # wandb watch
     if wandb_support:
@@ -411,8 +455,10 @@ def train(model,
         cos_accum = 0
 
         optimizer.zero_grad(set_to_none=True)
-        for (i,batch) in enumerate(tqdm(train_loader, desc=f'training at epoch {epoch}')):
-            loss, kl_div, loss_mmd_y, loss_cosine, loss_feat = train_step_perturb_model(
+        for (i,batch) in enumerate(
+            tqdm(train_loader, desc=f'training at epoch {epoch}')
+        ):
+            (loss, kl_div, loss_mmd_y, loss_cosine, loss_feat) = train_step_perturb_model(
                 model, 
                 batch, 
                 model.device, 
@@ -457,23 +503,32 @@ def train(model,
 
         # print training methods
         print(f'training KL = {epoch_kl:.5f} | mse = {epoch_mse:.3f} | cos = {epoch_cos:.3f}')
-
-        # save current epoch weights
-        # filepath = os.path.join(weights_dir, f"weights__model-{model.architecture_name}_epoch-{epoch}__nodes-{model.num_nodes}_b-{batch_size}_h-{model.n_channels}_p-{model.dropout_p}.pth")
-        # torch.save(model.state_dict(), filepath)
         
         # Validation & Early Stopping
         if epoch!=0:
 
-            _, avg_weighted_pert_wmse, avg_pert_wmse = test_perturb_model_pseudobulk(model, test_loader, device, compute_mmd_fn=None)
+            _, avg_weighted_pert_wmse, avg_pert_wmse = test_perturb_model(
+                model, 
+                test_loader, 
+                device, 
+                compute_mmd_fn=None
+            )
+
             test_wmse.append(avg_pert_wmse)
             test_weighted_wmse.append(avg_weighted_pert_wmse)
 
             # Check if this is the best model so far
-            is_best = (avg_pert_wmse > best_val_metric) if metric_mode == 'max' else (avg_pert_wmse < best_val_metric)
+            is_best = (
+                (avg_pert_wmse > best_val_metric)
+                if metric_mode == "max"
+                else (avg_pert_wmse < best_val_metric)
+            )
 
             if is_best:
-                print(f"Validation metric improved to {avg_pert_wmse:.4f}. Saving best model...")
+                print(
+                    f"Validation metric improved to {avg_pert_wmse:.4f}. "
+                    "Saving best model..."
+                )
                 best_val_metric = avg_pert_wmse
                 patience_counter = 0
                 torch.save(model.state_dict(), best_filepath)
@@ -497,13 +552,14 @@ def train(model,
 
             # Trigger Early Stopping
             if patience_counter >= patience:
-                print(f"Early stopping triggered! No improvement for {patience} epochs.")
+                print(
+                    "Early stopping triggered! " 
+                    f"No improvement for {patience} epochs."
+                )
                 break
     
-    # ==========================================
-    # FINAL EVALUATION PHASE
-    # ==========================================
 
+    # final evaluation phase
     print("\n--- Training concluded. Initiating Final Evaluation ---")
     
     # Reload the absolute best weights before running the final metric
@@ -512,7 +568,12 @@ def train(model,
         model.load_state_dict(torch.load(best_filepath))
     
     # Calculate the metric strictly ONCE
-    final_metric_val = final_val_AUPRC(model, test_loader, model.device, var_names)
+    final_metric_val = final_val_AUPRC(
+        model, 
+        test_loader, 
+        model.device, 
+        var_names
+    )
     print(f"FINAL TEST METRIC: {final_metric_val:.4f}")
     
     if wandb_support:
