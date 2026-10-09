@@ -4,10 +4,7 @@ from tqdm import tqdm
 import numpy as np
 import pandas as pd
 import anndata as ad
-import wandb
 import os
-
-
 
 def _get_beta_schedule(epoch, n_epochs, warmup_epochs=5, n_cycles=1, ratio=0.5):
     '''

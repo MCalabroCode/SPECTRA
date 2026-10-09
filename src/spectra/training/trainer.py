@@ -6,7 +6,6 @@ from tqdm import tqdm
 import numpy as np
 import pandas as pd
 import anndata as ad
-import wandb
 import os
 import uuid
 from collections import defaultdict
@@ -430,6 +429,8 @@ def train(model,
     best_val_metric = float('-inf') if metric_mode == 'max' else float('inf')
     patience_counter = 0
     if wandb_support and wandb.run is not None:
+        import wandb
+
         best_filepath = os.path.join(
             weights_dir,
             f"best_model_{model.architecture_name}_{wandb.run.id}.pth"

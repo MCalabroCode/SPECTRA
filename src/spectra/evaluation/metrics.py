@@ -4,7 +4,6 @@ import scanpy as sc
 import pertpy as pt
 import anndata as ad
 import scipy.stats as stats
-from sklearn.metrics import precision_recall_curve, auc, average_precision_score, confusion_matrix, ConfusionMatrixDisplay
 from statsmodels.stats.multitest import multipletests
 from numba import njit, prange
 from scipy import sparse
@@ -17,6 +16,14 @@ import json
 import math
 import sys
 import os
+
+from sklearn.metrics import (
+    precision_recall_curve, 
+    auc, 
+    average_precision_score, 
+    confusion_matrix, 
+    ConfusionMatrixDisplay
+)
 
 sc.settings.verbosity = 0
 
