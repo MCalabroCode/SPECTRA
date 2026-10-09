@@ -20,41 +20,53 @@ import plotly.io as pio
 import gseapy as gp
 
 
-# =====================================================================
 # Batch & Tensor Preparation Helper
-# =====================================================================
-
 def prepare_perturbation_batch(target_gene, control_adata, model, n_cells=256):
     """
     Constructs matched control inputs `x` and perturbation indicator tensor `pert`
     directly using `model.gene_to_idx`.
     """
     if model.gene_to_idx is None:
-        raise ValueError("Model does not have `gene_to_idx` initialized. Pass `gene_names` at model creation.")
+        raise ValueError(
+            "Model does not have `gene_to_idx` initialized. "
+            "Pass `gene_names` at model creation."
+        )
     
     pert_genes = [g for g in target_gene.split('+') if g in model.gene_to_idx]
     if not pert_genes:
-        raise ValueError(f"Target gene(s) '{target_gene}' not found in model's gene vocabulary.")
+        raise ValueError(
+            f"Target gene(s) '{target_gene}' not found in model's gene vocabulary."
+        )
 
     pert_single = torch.zeros(model.num_nodes, dtype=torch.bool)
     for g in pert_genes:
         pert_single[model.gene_to_idx[g]] = True
 
-    ctrl_mat = control_adata.X.tocsr() if sparse.issparse(control_adata.X) else sparse.csr_matrix(control_adata.X)
+    if sparse.issparse(control_adata.X):
+        ctrl_mat = control_adata.X.tocsr()
+    else:
+        ctrl_mat = sparse.csr_matrix(control_adata.X)
     ctrl_array = ctrl_mat.toarray()
     
     n_take = min(n_cells, ctrl_array.shape[0])
-    x = torch.tensor(ctrl_array[:n_take], dtype=torch.float32, device=model.device).unsqueeze(-1)
+    x = torch.tensor(
+        ctrl_array[:n_take], 
+        dtype=torch.float32, 
+        device=model.device
+    ).unsqueeze(-1)
     pert = pert_single.repeat(n_take, 1).to(model.device)
 
     return x, pert
 
 
-# =====================================================================
-# complete Path & Cascade Network Extraction
-# =====================================================================
-
-def get_cascade_network(A_matrices, target_gene, model, minimum_signal=0.1, K_edges=20):
+# complete Path and Cascade Network Extraction
+def get_cascade_network(
+    A_matrices, 
+    target_gene, 
+    model, 
+    minimum_signal=0.1, 
+    K_edges=20
+):
     """
     Extracts complete downstream paths of lengths 1, 2, and 3 originating from target_gene.
     Returns:
@@ -120,7 +132,13 @@ def get_cascade_network(A_matrices, target_gene, model, minimum_signal=0.1, K_ed
 
     return hop_to_genes, cascade_edges, all_signed_weights, list(network_genes)
 
-def _get_cascade_network_old(A_matrices, target_gene, idx_to_gene, minimum_signal=0.1, K_edges=20):
+def _get_cascade_network_old(
+    A_matrices, 
+    target_gene, 
+    idx_to_gene, 
+    minimum_signal=0.1, 
+    K_edges=20
+):
     """
     Builds the network from attention matrices and extracts the top edges per hop.
     old code, do not use.
@@ -171,9 +189,16 @@ def _get_cascade_network_old(A_matrices, target_gene, idx_to_gene, minimum_signa
     network_genes = list(set([label.split(' (')[0] for label in labels]))
     return hop_to_genes, cascade_edges, all_signed_weights, list(network_genes)
 
-def get_top_complete_paths(A_matrices, target_gene, model, K_paths=20, minimum_signal=1e-3):
+def get_top_complete_paths(
+    A_matrices, 
+    target_gene, 
+    model, 
+    K_paths=20, 
+    minimum_signal=1e-3
+):
     """
-    Finds top K complete paths of lengths 1, 2, and 3 scored by the product of FAGCN gate weights.
+    Finds top K complete paths of lengths 1, 2, and 3 scored 
+    by the product of FAGCN gate weights.
     """
     idx_to_gene = model.idx_to_gene
     target_idx = model.gene_to_idx[target_gene]
@@ -186,7 +211,9 @@ def get_top_complete_paths(A_matrices, target_gene, model, K_paths=20, minimum_s
         new_paths = []
         for nodes, weights in current_paths:
             source = nodes[-1]
-            targets = np.flatnonzero(np.abs(A[layer][source]) >= minimum_signal)
+            targets = np.flatnonzero(
+                np.abs(A[layer][source]) >= minimum_signal
+            )
 
             for target in targets:
                 if target in nodes:
@@ -210,12 +237,13 @@ def get_top_complete_paths(A_matrices, target_gene, model, K_paths=20, minimum_s
     return top_paths
 
 
-# =====================================================================
 # Gene Ontology Functional Annotation
-# =====================================================================
-
 def get_gene_ontology(network_genes, target_gene, background_genes, top_n=10):
-    """Queries Enrichr (via GSEAPY) to assign primary biological functions to cascade genes."""
+    """
+    Queries Enrichr (via GSEAPY) to assign primary biological 
+    functions to cascade genes.
+    """
+
     print("Querying Gene Ontology...")
     go_dict = gp.get_library(name='GO_Biological_Process_2026', organism='human')
     hallmark_dict = gp.get_library(name='MSigDB_Hallmark_2020', organism='human')
@@ -248,18 +276,19 @@ def get_gene_ontology(network_genes, target_gene, background_genes, top_n=10):
     return gene_to_function
 
 
-# =====================================================================
-# Pseudobulk & Wilcoxon DEG Statistics
-# =====================================================================
-
+# Pseudobulk and Wilcoxon DEG Statistics
 def get_pseudobulk(expr, B, N):
-    """Averages cell expressions across the batch in linear space (expm1)."""
+    """
+    Averages cell expressions across the batch in linear space (expm1).
+    """
     expr_np = expr.detach().cpu().reshape(B, N).numpy()
     return np.expm1(expr_np).mean(axis=0)
 
 
 def get_predicted_de_stats(y_hat, x_hat, model):
-    """Runs a paired Wilcoxon signed-rank test comparing predicted perturbed vs control cells."""
+    """
+    Runs a paired Wilcoxon signed-rank test comparing predicted perturbed vs control cells.
+    """
     B = y_hat.shape[0] // model.num_nodes
     N = model.num_nodes
 
@@ -278,13 +307,19 @@ def get_predicted_de_stats(y_hat, x_hat, model):
     return pvals, qvals
 
 
-# =====================================================================
 # Plotting Functions
-# =====================================================================
 
-def plot_sankey(target_gene, hop_to_genes, cascade_edges, all_signed_weights, gene_to_function, out_dir='cascade_plots'):
+def plot_sankey(
+    target_gene, 
+    hop_to_genes, 
+    cascade_edges, 
+    all_signed_weights, 
+    gene_to_function, 
+    out_dir='cascade_plots'
+):
     """
-    Renders and saves a multi-hop Plotly Sankey diagram of the information cascade.
+    Renders and saves a multi-hop Plotly Sankey diagram of the 
+    information cascade.
     """
     os.makedirs(out_dir, exist_ok=True)
     unique_groups = sorted(list(set(gene_to_function.values())))
@@ -309,19 +344,30 @@ def plot_sankey(target_gene, hop_to_genes, cascade_edges, all_signed_weights, ge
 
     for hop_num in range(4):
         genes_in_hop = list(hop_to_genes[hop_num])
-        genes_in_hop.sort(key=lambda g: (gene_to_function.get(g, 'Other / Unassigned'), g))
-        y_vals = [0.5] if len(genes_in_hop) == 1 else np.linspace(0.05, 0.95, len(genes_in_hop)) if genes_in_hop else []
+        genes_in_hop.sort(
+            key=lambda g: (gene_to_function.get(g, 'Other / Unassigned'), g)
+        )
+        if not genes_in_hop:
+            y_vals = []
+        elif len(genes_in_hop) == 1:
+            y_vals = [0.5]
+        else:
+            y_vals = np.linspace(0.05, 0.95, len(genes_in_hop))
 
         for gene, y_val in zip(genes_in_hop, y_vals):
             unique_id = f"{gene}_hop{hop_num}"
             node_id_to_idx[unique_id] = len(display_labels)
             display_labels.append(gene)
-            node_colors.append(group_colors[gene_to_function.get(gene, 'Other / Unassigned')])
+            node_colors.append(group_colors[
+                gene_to_function.get(gene, 'Other / Unassigned')
+            ])
             node_x.append(hop_x_map[hop_num])
             node_y.append(y_val)
 
     sources, targets, values, link_colors = [], [], [], []
-    max_abs_w = max([abs(w) for w in all_signed_weights]) if all_signed_weights else 1.0
+    max_abs_w = max(
+        [abs(w) for w in all_signed_weights]
+    ) if all_signed_weights else 1.0
     vmin, vmax = -max_abs_w, max_abs_w
     min_visual_weight = max_abs_w * 0.05
 
@@ -331,7 +377,9 @@ def plot_sankey(target_gene, hop_to_genes, cascade_edges, all_signed_weights, ge
         values.append(max(abs_w, min_visual_weight))
         norm_w = (w - vmin) / (vmax - vmin)
         rgba = plt.cm.coolwarm(norm_w)
-        link_colors.append(f'rgba({int(rgba[0]*255)}, {int(rgba[1]*255)}, {int(rgba[2]*255)}, 0.8)')
+        link_colors.append(
+            f'rgba({int(rgba[0]*255)}, {int(rgba[1]*255)}, {int(rgba[2]*255)}, 0.8)'
+        )
 
     fig = go.Figure()
     fig.add_trace(go.Sankey(
@@ -349,14 +397,19 @@ def plot_sankey(target_gene, hop_to_genes, cascade_edges, all_signed_weights, ge
     ))
 
     colorscale = [[i / 10, f"rgb({int(c[0]*255)}, {int(c[1]*255)}, {int(c[2]*255)})"]
-                  for i, c in enumerate([plt.cm.coolwarm(v) for v in np.linspace(0, 1, 11)])]
+                  for i, c in enumerate(
+                        [plt.cm.coolwarm(v) for v in np.linspace(0, 1, 11)]
+                    )
+                ]
 
     fig.add_trace(go.Scatter(
         x=[None, None], y=[None, None], mode="markers",
         marker=dict(
             size=0.1, color=[vmin, vmax], cmin=vmin, cmax=vmax,
             colorscale=colorscale, showscale=True,
-            colorbar=dict(title="Edge weight", x=1.02, y=0.55, len=0.95, thickness=18)
+            colorbar=dict(
+                title="Edge weight", x=1.02, y=0.55, len=0.95, thickness=18
+            )
         ),
         hoverinfo="skip", showlegend=False
     ))
@@ -374,27 +427,59 @@ def plot_sankey(target_gene, hop_to_genes, cascade_edges, all_signed_weights, ge
         title_x=0.5, font_size=12, height=800, plot_bgcolor='white',
         xaxis=dict(visible=False, showgrid=False, zeroline=False),
         yaxis=dict(visible=False, showgrid=False, zeroline=False),
-        legend=dict(orientation="h", yanchor="top", y=-0.12, xanchor="center", x=0.5,
-                    entrywidth=0.18, entrywidthmode="fraction")
+        legend=dict(
+            orientation="h", 
+            yanchor="top", 
+            y=-0.12, 
+            xanchor="center", 
+            x=0.5,
+            entrywidth=0.18, 
+            entrywidthmode="fraction"
+        )
     )
     fig.show()
-    pio.write_image(fig, file=f'{out_dir}/{target_gene}_cascade_sankey.pdf', width=1500, height=800, scale=1)
+    pio.write_image(
+        fig, 
+        file=f'{out_dir}/{target_gene}_cascade_sankey.pdf', 
+        width=1500, 
+        height=800, 
+        scale=1
+    )
 
 
-def plot_cascade_logfc(network_genes, model, pseudobulk_pert, pseudobulk_ctrl, target_gene,
-                       qvals=None, fdr_threshold=0.05, logfc_threshold=0.25, pseudocount=1e-3, out_dir='cascade_plots'):
-    """Plots predicted pseudobulk log2FC for genes discovered in the cascade."""
+def plot_cascade_logfc(
+    network_genes, 
+    model, 
+    pseudobulk_pert, 
+    pseudobulk_ctrl, 
+    target_gene,
+    qvals=None, 
+    fdr_threshold=0.05, 
+    logfc_threshold=0.25, 
+    pseudocount=1e-3,
+    out_dir='cascade_plots'
+):
+    """
+    Plots predicted pseudobulk log2FC for genes discovered in the cascade.
+    """
+
     os.makedirs(out_dir, exist_ok=True)
-    genes = [g for g in network_genes if g in model.gene_to_idx and g != target_gene]
+    genes = [
+        g for g in network_genes if g in model.gene_to_idx and g != target_gene
+    ]
 
     logfc = []
     significant = []
     for gene in genes:
         idx = model.gene_to_idx[gene]
-        fc = np.log2((pseudobulk_pert[idx] + pseudocount) / (pseudobulk_ctrl[idx] + pseudocount))
+        fc = np.log2(
+            (pseudobulk_pert[idx] + pseudocount) / (pseudobulk_ctrl[idx] + pseudocount)
+        )
         logfc.append(fc)
         if qvals is not None:
-            significant.append((qvals[idx] < fdr_threshold) and (abs(fc) >= logfc_threshold))
+            significant.append(
+                (qvals[idx] < fdr_threshold) and (abs(fc) >= logfc_threshold)
+            )
 
     logfc = np.asarray(logfc)
     order = np.argsort(logfc)
@@ -418,18 +503,32 @@ def plot_cascade_logfc(network_genes, model, pseudobulk_pert, pseudobulk_ctrl, t
     ax.set_title(f"Predicted expression changes in {target_gene} cascade")
 
     if qvals is not None:
-        ax.legend(handles=[Patch(facecolor="white", edgecolor="black", hatch="///",
-                                 label=f"Not significant (logFC<{logfc_threshold}, fdr>{fdr_threshold})")],
-                  frameon=False)
+        ax.legend(
+            handles=[Patch(
+                facecolor="white", 
+                edgecolor="black", 
+                hatch="///",
+                label=f"Not significant (logFC<{logfc_threshold}, fdr>{fdr_threshold})"
+            )],
+            frameon=False)
 
     plt.tight_layout()
     plt.savefig(f'{out_dir}/{target_gene}_cascade_logfc.pdf')
     plt.show()
 
 
-def plot_gate_vs_coexpression(target_gene, cascade_edges, y_hat, model, B, plot=True, out_dir='cascade_plots'):
+def plot_gate_vs_coexpression(
+    target_gene, 
+    cascade_edges, 
+    y_hat, 
+    model, 
+    B, 
+    plot=True, 
+    out_dir='cascade_plots'
+):
     """
-    Validates FAGCN gate weights against empirical co-expression correlation in predicted perturbed cells.
+    Validates FAGCN gate weights against empirical co-expression correlation 
+    in predicted perturbed cells.
     """
     os.makedirs(out_dir, exist_ok=True)
     y_pert = y_hat.detach().cpu().reshape(B, model.num_nodes).numpy()
@@ -457,14 +556,19 @@ def plot_gate_vs_coexpression(target_gene, cascade_edges, y_hat, model, B, plot=
         ax.axhline(0, color="black", linewidth=0.5, linestyle='dashed')
         ax.axvline(0, color="black", linewidth=0.5, linestyle='dashed')
         ax.set_xlabel("FAGCN edge weight")
-        ax.set_ylabel("Pearson correlation of connected genes\n(predicted perturbed cells)")
+        ax.set_ylabel(
+            "Pearson correlation of connected genes\n"
+            "(predicted perturbed cells)"
+        )
         ax.set_title(
             f"Gate weight vs gene-expression correlation\n"
             f"Pearson r = {pearson_r:.2f}, p = {pearson_p:.2e}\n"
             f"Spearman ρ = {spearman_r:.2f}, p = {spearman_p:.2e}"
         )
         plt.tight_layout()
-        plt.savefig(f'{out_dir}/{target_gene}_correlation_weights_vs_coexpression.pdf')
+        plt.savefig(
+            f'{out_dir}/{target_gene}_correlation_weights_vs_coexpression.pdf'
+        )
         plt.show()
 
     return {
@@ -476,7 +580,12 @@ def plot_gate_vs_coexpression(target_gene, cascade_edges, y_hat, model, B, plot=
     }
 
 
-def plot_complete_path_dot_heatmaps(top_paths, target_gene, dot_scale=700, out_dir='cascade_plots'):
+def plot_complete_path_dot_heatmaps(
+    top_paths, 
+    target_gene, 
+    dot_scale=700, 
+    out_dir='cascade_plots'
+):
     """
     Generates dot-heatmaps displaying layer-wise complete paths and edge weights.
     """

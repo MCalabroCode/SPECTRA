@@ -5,8 +5,12 @@ import anndata as ad
 
 def generate_adata_baseline(gene_counts_dict, train_adata):
     """
-    Generates an AnnData object using a simple pseudobulk average baseline model.
-    Duplicates the mean expression profile for n_samples.
+    Generates an AnnData object using a simple pseudobulk average 
+    baseline model. Duplicates the mean expression profile for n_samples.
+
+    This is the same baseline model define in STATE or in "Diversity by 
+    Design: Addressing Mode Collapse Improves scRNA-seq Perturbation
+    Modeling on Well-Calibrated Metrics", Miller et al.
     """
 
     prediction_list = []
@@ -34,7 +38,7 @@ def generate_adata_baseline(gene_counts_dict, train_adata):
         else:
             pert_pred = global_mean
             
-        # repeat the 1D prediction array into a 2D array of shape [n_samples, n_genes]
+        # repeat the 1D prediction array for n_samples times
         repeated_preds = np.tile(pert_pred, (n_samples, 1))
         
         prediction_list.append(repeated_preds)
@@ -49,19 +53,20 @@ def generate_adata_baseline(gene_counts_dict, train_adata):
     return pred_adata
 
 def technical_duplicate_baseline(adata):
-    '''
+    """
     We compute this baseline by randomly dividing the population of cells 
     receiving a perturbation in half and using one half of the cells to
-    predict the other half. Works only for pertubrations already seen.
-    '''
+    predict the other half. Works only for pertubrations already seen
+    during training.
+    """
     indices_1 = []
     indices_2 = []
     for gene, idx in adata.obs.groupby("target_gene").indices.items():
         idx = np.array(idx) # list of indices associated to gene (the target_gene)
         np.random.shuffle(idx)  # Randomize indices
         half = len(idx) // 2
-        #indices_1.extend(idx[:half])
+        indices_1.extend(idx[:half])
         indices_2.extend(idx[half:])
-    #real_adata = adata[indices_1].copy()
+    real_adata = adata[indices_1].copy()
     pred_adata = adata[indices_2].copy()
-    return pred_adata
+    return real_adata, pred_adata
