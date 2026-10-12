@@ -2,7 +2,7 @@
 
 **SPectral CRISPR Transcriptome Regulatory Autoencoder**
 
-SPECTRA is a graph-based generative model designed to simulate single-cell transcriptional responses to out-of-distribution (OOD) CRISPR gene knockouts. By leveraging prior Gene Regulatory Networks (GRNs) and foundational gene embeddings (e.g., scGPT), SPECTRA explicitly propagates perturbation signals through directed network topologies to capture sparse, localized regulatory cascades.
+SPECTRA is a graph-based generative model designed to simulate single-cell transcriptional responses to out-of-distribution (OOD) CRISPR gene knockouts. By leveraging prior Gene Regulatory Networks (GRNs) SPECTRA explicitly propagates perturbation signals through directed network topologies to capture sparse, localized regulatory cascades.
 
 ---
 
@@ -17,7 +17,6 @@ SPECTRA/
 │   └── sweep_config.yaml
 │
 ├── data/                   # Directory for h5ad datasets, GRNs, and gene embeddings
-│   └── (See Data Setup section below)
 │
 ├── src/
 │   └── spectra/            # Core Python package
@@ -49,22 +48,57 @@ cd SPECTRA
 ```
 
 2. **Create and activate a virtual environment**:
+   SPECTRA was developed in python 3.11:
 
 ```bash
 python3.11 -m venv spectra_venv
 source spectra_venv/bin/activate
 ```
 
-3. **Install the package locally:**
+3. **Install hardware-compatible versions of PyTorch and PyTorch Geometric**
+   SPECTRA was developed using **PyTorch 2.4.1** and **CUDA 12.1**.
+   If your GPU cluster uses a different CUDA version or you are running on CPU, adjust the PyTorch and PyG installation links accordingly.
+
+```bash
+pip install torch==2.4.1+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
+pip install pyg-lib torch_scatter torch_sparse torch_cluster torch_spline_conv \
+  -f https://data.pyg.org/whl/torch-2.4.0+cu121.html
+```
+
+4. **Install the package locally:**
+   To install SPECTRA with only the core dependencies required for training, data preprocessing, and evaluation, run:
+
+```bash
+pip install -e .
+```
+
+**OPTIONAL DEPENDENCIES**
+
+SPECTRA uses modular optional dependencies so you can install specialized toolkits only when needed:
+
+* run `pip install -e ".[sankey]"` to install SPECTRA together with the requirements to reproduce the **interpretability & Sankey diagrams**.
+* run `pip install -e ".[eval]"` to install SPECTRA together with the **extended benchmark suite** (Pertpy and [`cell-eval`](https://github.com/ArcInstitute/cell-eval) metrics)
+* run `pip install -e ".[wandb]"` to install SPECTRA together with the **support for hyperparameter sweeps** (wandb logging)
+
+**We strongly suggest to install SPECTRA with every optional tooklit provided** (plotting, benchmarking, tracking, and notebooks, etc) by running:
+
+```bash
+pip install -e ".[all]"
+```
+
+### installation via `requirements.txt`
+
+For strict reproducibility of the results reported in the paper, we recommend creating the exact environment used in our experiments by installing the dependencies from `requirements.txt`.
+
+After completing steps 1. and 2. above, run:
 
 ```bash
 python -m pip install -r requirements.txt
-pip install -e .
 ```
 
 ## 🚀 Training
 
-To train a SPECTRA model on a specific dataset, use the [`scripts/train.py`](scripts/train.py) script. The YAML config file specifies the paths to your dataset, network file, and hyperparameters.
+To train a SPECTRA model on a specific dataset, use the [`scripts/train.py`](scripts/train.py) script. The YAML config file specifies the paths to your dataset, network file, and hyperparameters. For examples of the expected configuration structure see the YAML files in the `config` directory.
 
 ```bash
 python scripts/train.py --config configs/config.yaml
@@ -74,7 +108,7 @@ Trained model weights will be saved automatically inside the `weights/` director
 
 ### Hyperparameter Sweeps (Weights & Biases)
 
-SPECTRA supports automated Bayesian hyperparameter optimization via Weights & Biases.
+SPECTRA supports automated Bayesian hyperparameter optimization via Weights & Biases. It requires `wandb` to be installed (see the installation guide above).
 To initialize a sweep and start an agent:
 
 ```bash
@@ -85,16 +119,17 @@ python scripts/run_sweep.py --config configs/sweep_config.yaml --count 10
 
 ### 1. Interactive Inference & Interpretability
 
-To load a pre-trained model, generate data and test predictions interactively, refer to [`notebooks/spectra_testing.ipynb`](notebooks/spectra_testing.ipynb). 
+To load a pre-trained model, generate data and test predictions interactively, refer to [`notebooks/spectra_testing.ipynb`](notebooks/spectra_testing.ipynb).
 
 This tutorial walks through:
+
 - Generating single-cell and pseudobulk expression predictions for out-of-distribution (OOD) knockouts.
 - Extracting directed perturbation-induced cascades and gene regulatory flow.
-- Generating Sankey path flow diagrams and Gene Ontology (GO) enrichment plots.
+- Generating Sankey path flow diagrams and Gene Ontology (GO) enrichment plots, as well as other figures present in the paper.
 
 ### 2. Single-Run Evaluation CLI
 
-To evaluate a single run against ground truth using standard perturbation metrics, use [`scripts/evaluate.py`](scripts/evaluate.py). 
+To evaluate a single run against ground truth using standard perturbation metrics, use [`scripts/evaluate.py`](scripts/evaluate.py).
 
 Ensure your ground-truth AnnData and model predictions follow the naming convention `pred_adata-<model_name>.h5ad`:
 
@@ -120,14 +155,12 @@ python scripts/evaluate.py \
 For comprehensive, multi-seed statistical evaluation across baselines:
 
 * **Custom Benchmark Suite (`notebooks/benchmark.ipynb`):**
-Evaluates multiple repeated runs across models (`SPECTRA`, `GEARS`, `scLambda`, and mean baselines), computing distribution-level and DEG-focused metrics (WMSE, MSE, Wasserstein distance, AUPRC, and differential expression F1/Precision) with automated disk caching and summary reporting.
+  Evaluates multiple repeated runs across models (currently `SPECTRA`, `GEARS`, `scLambda`, and mean baselines), computing distribution-level and DEG-focused metrics (WMSE, MSE, Wasserstein distance, AUPRC, and differential expression F1/Precision) with automated disk caching and summary reporting.
 * **Standardized Arc Cell-Eval (`notebooks/benchmark_cell_eval.ipynb`):**
-Benchmarks models using the standardized [`cell-eval`](https://github.com/ArcInstitute/cell-eval) framework. Computes:
+  Benchmarks models using the standardized [`cell-eval`](https://github.com/ArcInstitute/cell-eval) framework. Computes:
 * **DEG Overlap & Precision:** `overlap_at_N`, `overlap_at_50/100/200/500`, and `precision_at_k`.
 * **Effect Directionality & Correlation:** `de_direction_match`, `de_spearman_sig`, and `pearson_delta`.
 * **Distance & Discrimination:** L1/L2/cosine discrimination scores, `pearson_edistance`, MSE/MAE, and clustering agreement.
-
-
 
 ## 📄 Citation
 

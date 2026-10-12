@@ -361,6 +361,9 @@ def train(model,
                 (lower is better).
     """
 
+    if wandb_support:
+        import wandb
+
     # estract hyperparameters from model.config
     peak_lr = model.config['lr']
     n_epochs = model.config['n_epochs'] 
@@ -429,8 +432,6 @@ def train(model,
     best_val_metric = float('-inf') if metric_mode == 'max' else float('inf')
     patience_counter = 0
     if wandb_support and wandb.run is not None:
-        import wandb
-
         best_filepath = os.path.join(
             weights_dir,
             f"best_model_{model.architecture_name}_{wandb.run.id}.pth"

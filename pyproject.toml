@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spectra"
+dynamic = ["version"]
+description = "SPECTRA: predicting cellular perturbation responses with graph learning over gene regulatory networks"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Michele Calabrò", email = 'michele.calabro@fht.org' }]
+requires-python = ">=3.11"
+
+# Core dependencies: flexible bounds so users can install without conflicts
+dependencies = [
+    "torch>=2.2.0",
+    "torch-geometric>=2.5.0",
+    "scanpy~=1.11.4",
+    "anndata>=0.10.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "pandas>=2.0.0",
+    "scikit-learn>=1.4.0",
+    "statsmodels<0.15.0",
+    "networkx>=3.0",
+    "numba>=0.58.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.66.0",
+    "matplotlib>=3.8.0",
+    "seaborn>=0.13.0",
+]
+
+# Modular extras
+[project.optional-dependencies]
+sankey = [
+    "gseapy>=1.1.0",
+    "plotly>=5.18.0",
+    "kaleido>=1.0.0",
+    "nbformat>=4.2.0",
+]
+eval = [
+    "pertpy~=1.0.3",
+    "cell-eval",
+]
+wandb = [
+    "wandb>=0.17.0",
+]
+notebooks = [
+    "ipykernel",
+]
+dev = [
+    "pytest>=8.0.0",
+]
+# All extras combined for convenience
+all = [
+    "spectra[sankey,eval,wandb,notebooks,dev]",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools_scm]
+local_scheme = "no-local-version"
