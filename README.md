@@ -47,8 +47,9 @@ git clone https://github.com/MCalabroCode/SPECTRA.git
 cd SPECTRA
 ```
 
-2. **Create and activate a virtual environment**:
-   SPECTRA was developed in python 3.11:
+2. **Create and activate a virtual environment**
+  
+    SPECTRA was developed in python 3.11:
 
 ```bash
 python3.11 -m venv spectra_venv
@@ -56,6 +57,7 @@ source spectra_venv/bin/activate
 ```
 
 3. **Install hardware-compatible versions of PyTorch and PyTorch Geometric**
+
    SPECTRA was developed using **PyTorch 2.4.1** and **CUDA 12.1**.
    If your GPU cluster uses a different CUDA version or you are running on CPU, adjust the PyTorch and PyG installation links accordingly.
 
@@ -65,7 +67,8 @@ pip install pyg-lib torch_scatter torch_sparse torch_cluster torch_spline_conv \
   -f https://data.pyg.org/whl/torch-2.4.0+cu121.html
 ```
 
-4. **Install the package locally:**
+4. **Install the package locally**
+
    To install SPECTRA with only the core dependencies required for training, data preprocessing, and evaluation, run:
 
 ```bash
@@ -109,6 +112,7 @@ Trained model weights will be saved automatically inside the `weights/` director
 ### Hyperparameter Sweeps (Weights & Biases)
 
 SPECTRA supports automated Bayesian hyperparameter optimization via Weights & Biases. It requires `wandb` to be installed (see the installation guide above).
+
 To initialize a sweep and start an agent:
 
 ```bash
@@ -158,9 +162,9 @@ For comprehensive, multi-seed statistical evaluation across baselines:
   Evaluates multiple repeated runs across models (currently `SPECTRA`, `GEARS`, `scLambda`, and mean baselines), computing distribution-level and DEG-focused metrics (WMSE, MSE, Wasserstein distance, AUPRC, and differential expression F1/Precision) with automated disk caching and summary reporting.
 * **Standardized Arc Cell-Eval (`notebooks/benchmark_cell_eval.ipynb`):**
   Benchmarks models using the standardized [`cell-eval`](https://github.com/ArcInstitute/cell-eval) framework. Computes:
-* **DEG Overlap & Precision:** `overlap_at_N`, `overlap_at_50/100/200/500`, and `precision_at_k`.
-* **Effect Directionality & Correlation:** `de_direction_match`, `de_spearman_sig`, and `pearson_delta`.
-* **Distance & Discrimination:** L1/L2/cosine discrimination scores, `pearson_edistance`, MSE/MAE, and clustering agreement.
+  * **DEG Overlap & Precision:** `overlap_at_N`, `overlap_at_50/100/200/500`, and `precision_at_k`.
+  * **Effect Directionality & Correlation:** `de_direction_match`, `de_spearman_sig`, and `pearson_delta`.
+  * **Distance & Discrimination:** L1/L2/cosine discrimination scores, `pearson_edistance`, MSE/MAE, and clustering agreement.
 
 ## 📄 Citation
 
