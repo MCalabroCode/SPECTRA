@@ -14,7 +14,12 @@ import os
 warnings.filterwarnings("ignore")
 
 from spectra.utils import set_seed
-from spectra.data import data_preprocessing, build_model_dataloaders_perts_split, compute_weights, compute_weights_enhanced
+from spectra.data import (
+    data_preprocessing, 
+    build_model_dataloaders_perts_split, 
+    compute_weights, 
+    compute_weights_enhanced
+)
 from spectra.model import SPECTRA
 from spectra.training import train
 from spectra.data import build_model_dataloaders_from_perts_list
@@ -43,14 +48,6 @@ def main(config):
 
     with open(config['data']['scgpt_embeddings_path'], "rb") as f:
         scgpt_dict = pickle.load(f)
-
-    # # Filter to user genes - TODO: maybe not needed
-    # print("Loading gene list...")
-    # with open(config['data']['gene_list_path'], 'r') as file:
-    #     user_genes = set([line.strip() for line in file.readlines()])
-    # if user_genes != user_genes & set(adata.var_names):
-    #     print('WARNING: some genes in the provided gene list are not included in the dataset; filtering them out...')
-    # adata = adata[:, adata.var_names.isin(user_genes)] # first gene filtering
 
     # Build Network Graph
     print("Building Gene Regulatory Network...")
@@ -108,7 +105,9 @@ def main(config):
     model_config['dataset_size'] = adata.shape[0]
     model_config['pert_to_idx'] = {pert: i for i, pert in enumerate(perturbations)}
     
-    train_loader, val_loader, test_loader, _, _, _, _, _, _ = build_model_dataloaders_from_perts_list(adata, model_config, config['data']['split_path'])
+    train_loader, val_loader, test_loader, _, _, _, _, _, _ = build_model_dataloaders_from_perts_list(
+        adata, model_config, config['data']['split_path']
+    )
 
     # Load WMSE Weights
     print('Building DEGs weights...')

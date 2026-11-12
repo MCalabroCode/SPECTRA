@@ -248,7 +248,7 @@ def build_model_dataloaders_from_perts_list(adata, config, json_path):
     batch_size = config.get('batch_size', 32)
     pert_to_idx = config.get('pert_to_idx')
     
-    # 1. Load the splits from the JSON file
+    # Load the splits from the JSON file
     with open(json_path, 'r') as f:
         split_data = json.load(f)
         
@@ -262,18 +262,18 @@ def build_model_dataloaders_from_perts_list(adata, config, json_path):
     num_test_perts = len(test_perts)
     total_perts = num_train_perts + num_val_perts + num_test_perts
 
-    # 2. Isolate control cells
-    ctrl_adata = adata[adata.obs['target_gene'] == 'non-targeting'].copy()
+    # Isolate control cells
+    ctrl_adata = adata[adata.obs['target_gene'] == 'non-targeting']
     num_ctrls = ctrl_adata.shape[0]
     
-    # 3. Calculate dynamic split sizes for control cells based on JSON proportions
+    # Calculate dynamic split sizes for control cells based on JSON proportions
     train_ratio = num_train_perts / total_perts
     val_ratio = num_val_perts / total_perts
     
     train_size_c = int(num_ctrls * train_ratio)
     val_size_c = int(num_ctrls * val_ratio)
     
-    # 4. Shuffle and split the control cells (preventing data leakage)
+    # Shuffle and split the control cells (preventing data leakage)
     np.random.seed(seed)
     ctrl_indices = np.random.permutation(num_ctrls)
     
@@ -281,19 +281,19 @@ def build_model_dataloaders_from_perts_list(adata, config, json_path):
     val_ctrl = ctrl_adata[ctrl_indices[train_size_c:train_size_c + val_size_c]]
     test_ctrl = ctrl_adata[ctrl_indices[train_size_c + val_size_c:]]
     
-    # 5. Build individual adatas by filtering for specific perturbations + controls
+    # Build individual adatas by filtering for specific perturbations + controls
     train_adata = ad.concat([adata[adata.obs['target_gene'].isin(train_perts)], train_ctrl])
     val_adata = ad.concat([adata[adata.obs['target_gene'].isin(val_perts)], val_ctrl])
     test_adata = ad.concat([adata[adata.obs['target_gene'].isin(test_perts)], test_ctrl])
 
     gene_to_idx = {node: i for i, node in enumerate(adata.var_names)}
 
-    # 6. Create datasets 
+    # Create datasets 
     train_dataset = PerturbationDataset(train_adata, gene_to_idx, pert_to_idx, control_sampling="random")
     val_dataset = PerturbationDataset(val_adata, gene_to_idx, pert_to_idx, control_sampling="fixed")
     test_dataset = PerturbationDataset(test_adata, gene_to_idx, pert_to_idx, control_sampling="fixed")
 
-    # 7. Create loaders
+    # Create loaders
     train_loader = DataLoader(train_dataset, batch_sampler=SCDATA_sampler(train_dataset, batch_size, shuffle=True), num_workers=N_WORKERS, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_sampler=SCDATA_sampler(val_dataset, batch_size, shuffle=False), num_workers=N_WORKERS, pin_memory=True) 
     test_loader = DataLoader(test_dataset, batch_sampler=SCDATA_sampler(test_dataset, batch_size, shuffle=False), num_workers=N_WORKERS, pin_memory=True) 

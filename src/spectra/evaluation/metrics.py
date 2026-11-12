@@ -176,18 +176,19 @@ class RobustDES:
         G_true = set(df_true.index)
         n_true = len(G_true)
 
-        if n_true == 0:
-            return 0.0 # Avoid division by zero, or handle as specific case
-
         # identify Predicted DE Genes (G_pred)
         df_pred, result_df_pred = self.get_de_genes(adata_pred, perturbation_key, perturb_label, control_label,
                                                     eligible=result_df_true.set_index('names')['eligible'])
         G_pred = set(df_pred.index)
         n_pred = len(G_pred)
 
+        # NOTE: if the model corrrectly predicts 0 DEGs, return 1
+        if n_true == 0 or n_pred == 0:
+            return float(n_true == n_pred)
+
         # true positives
         TP = G_pred.intersection(G_true)
-        score = len(TP)/(n_pred+1e-8)
+        score = len(TP)/n_pred
 
         return score
     
@@ -200,14 +201,15 @@ class RobustDES:
         G_true = set(df_true.index)
         n_true = len(G_true)
 
-        if n_true == 0:
-            return 0.0 # Avoid division by zero, or handle as specific case
-
         # identify Predicted DE Genes (G_pred)
         df_pred, result_df_pred = self.get_de_genes(adata_pred, perturbation_key, perturb_label, control_label,
                                                     eligible=result_df_true.set_index('names')['eligible'])
         G_pred = set(df_pred.index)
         n_pred = len(G_pred)
+
+        # NOTE: if the model corrrectly predicts 0 DEGs, return 1
+        if n_true == 0 or n_pred == 0:
+            return float(n_true == n_pred)
 
         # jaccard index
         intersection = G_pred.intersection(G_true)
@@ -223,14 +225,15 @@ class RobustDES:
         G_true = set(df_true.index)
         n_true = len(G_true)
 
-        if n_true == 0:
-            return 0.0 # Avoid division by zero, or handle as specific case
-
         # identify Predicted DE Genes (G_pred)
         df_pred, result_df_pred = self.get_de_genes(adata_pred, perturbation_key, perturb_label, control_label,
                                                     eligible=result_df_true.set_index('names')['eligible'])
         G_pred = set(df_pred.index)
         n_pred = len(G_pred)
+
+        # NOTE: if the model corrrectly predicts 0 DEGs, return 1
+        if n_true == 0 or n_pred == 0:
+            return float(n_true == n_pred)
 
         # true positives
         TP = G_pred.intersection(G_true)

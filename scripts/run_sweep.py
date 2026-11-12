@@ -48,8 +48,8 @@ def load_all_data(config):
     # NOTE: for vcc dataset, log-transform is requested. 
     # NOTE: replogle already processed (replogle_preprocessing.ipynb)
     adata = data_preprocessing(adata,
-        logtransform=False, 
-        min_cells_per_pert=30
+        logtransform=True, 
+        min_cells_per_pert=50
     )
 
     with open(config['data']['scgpt_embeddings_path'], "rb") as f:
